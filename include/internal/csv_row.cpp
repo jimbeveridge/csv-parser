@@ -105,7 +105,7 @@ namespace csv {
         for (; start < this->sv.size() && this->sv[start] == ' '; start++);
         for (end = start; end < this->sv.size() && this->sv[end] != ' '; end++);
         
-        unsigned long long int value = 0;
+        unsigned long int val = 0;
 
         size_t digits = (end - start);
         size_t base16_exponent = digits - 1;
@@ -156,11 +156,11 @@ namespace csv {
                 return false;
             }
 
-            value += digit * pow(16, base16_exponent);
+            val += digit << (4 * base16_exponent);
             base16_exponent--;
         }
 
-        parsedValue = value;
+        parsedValue = val;
         return true;
     }
 
