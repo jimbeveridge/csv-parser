@@ -235,9 +235,9 @@ namespace csv {
         std::string csv_escape(T in) {
             IF_CONSTEXPR(std::is_convertible<T, csv::string_view>::value) {
                 return _csv_escape(in);
-            }
-            
-            return _csv_escape(std::string(in));
+            } else {
+                return _csv_escape(std::string(in));
+            }            
         }
 
         std::string _csv_escape(csv::string_view in) {
