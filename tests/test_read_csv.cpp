@@ -29,6 +29,18 @@ TEST_CASE( "Test Reading CSV From Direct Input", "[read_csv_direct]" ) {
         REQUIRE(vector<string>(row) == first_row);
     }
 
+	SECTION("Expected Results: Missing newline at end") {
+		auto rows = "A,B,C\r\n" // Header row
+			"123,234,345\r\n"
+			"1,2,3"_csv;
+
+		CSVRow row;
+		rows.read_row(row);
+		rows.read_row(row);
+		vector<string> second_row = { "1", "2", "3" };
+		REQUIRE(vector<string>(row) == second_row);
+	}
+
     SECTION("Expected Results: No Header") {
         auto rows = "123,234,345\r\n"
             "1,2,3\r\n"
@@ -433,27 +445,24 @@ TEST_CASE("Long Row Test", "[long_row_regression]") {
 
     // Make header row
     for (int i = 0; i < n_cols; i++) {
-        csv_string << i;
-        if (i + 1 == n_cols) {
-            csv_string << std::endl;
-        }
-        else {
+        if (i) {
             csv_string << ',';
         }
+        csv_string << i;
     }
+    csv_string << std::endl;
 
     // Make data row
     for (int i = 0; i < n_cols; i++) {
-        csv_string << (double)i * 0.000001;
-        if (i + 1 == n_cols) {
-            csv_string << std::endl;
-        }
-        else {
+        if (i) {
             csv_string << ',';
         }
+        csv_string << (double)i * 0.000001;
     }
+    csv_string << std::endl;
 
     auto rows = parse(csv_string.str());
+
     REQUIRE(rows.get_col_names().size() == n_cols);
 
     CSVRow row;

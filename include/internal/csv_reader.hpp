@@ -222,8 +222,8 @@ namespace csv {
 
         /** Read initial chunk to get metadata */
         void initial_read() {
-            this->read_csv_worker = std::thread(&CSVReader::read_csv, this, internals::ITERATION_CHUNK_SIZE);
-            this->read_csv_worker.join();
+            // Read directly so that we don't have to wait for a thread to start.
+            read_csv(1 << 20);
         }
 
         void trim_header();

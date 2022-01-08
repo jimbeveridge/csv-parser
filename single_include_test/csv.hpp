@@ -5500,15 +5500,17 @@ namespace csv {
             void allocate();
         };
 
+        class CSVBasicMMapSource;
 
         /** A class for storing raw CSV data and associated metadata */
         struct RawCSVData {
-            std::shared_ptr<void> _data = nullptr;
+            std::shared_ptr<CSVBasicMMapSource> _dataMmap;
+            std::shared_ptr<std::string> _dataString;
             csv::string_view data = "";
 
             internals::CSVFieldList fields;
 
-            std::unordered_set<size_t> has_double_quotes = {};
+            std::unordered_set<size_t> has_double_quotes;
 
             // TODO: Consider replacing with a more thread-safe structure
             std::unordered_map<size_t, std::string> double_quote_fields = {};
@@ -5516,6 +5518,43 @@ namespace csv {
             internals::ColNamesPtr col_names = nullptr;
             internals::ParseFlagMap parse_flags;
             internals::WhitespaceMap ws_flags;
+            size_t CreateMmapSource(const std::string& filename, size_t mmap_pos, size_t length);
+
+            size_t CreateStringViewSource(std::string_view source, size_t stream_pos, size_t length)
+            {
+                source.remove_prefix(stream_pos);
+                if (length < source.size()) {
+                    source.remove_suffix(source.size() - length);
+                }
+
+                // Create string_view onto the string
+                this->data = source;
+                return stream_pos + length;
+            }
+
+            size_t CreateStringSource(std::string&& source, size_t stream_pos, size_t length)
+            {
+                this->_dataString = std::make_shared<std::string>(std::move(source));
+                this->_dataString->resize(length);
+
+                // Create string_view onto the string
+                this->data = *this->_dataString.get();
+                return stream_pos + length;
+            }
+
+            template<typename TStream>
+            size_t CreateStringSource(TStream& source, size_t stream_pos, size_t length)
+            {
+                std::shared_ptr<std::string> str = std::make_shared<std::string>(length, ' ');
+                source.seekg(stream_pos, std::ios::beg);
+                source.read(str->data(), length);
+                size_t new_stream_pos = source.tellg();
+                this->_dataString = str;
+
+                // Create string_view onto the string
+                this->data = *str.get();
+                return new_stream_pos;
+            }
         };
 
         using RawCSVDataPtr = std::shared_ptr<RawCSVData>;
@@ -6070,13 +6109,13 @@ namespace csv {
             ///@}
 
             /** Whether or not source needs to be read in chunks */
-            CONSTEXPR bool no_chunk() const { return this->source_size < ITERATION_CHUNK_SIZE; }
+            CONSTEXPR bool no_chunk(size_t bytes) const { return this->source_size < bytes; }
 
             /** Parse the current chunk of data *
              *
              *  @returns How many character were read that are part of complete rows
              */
-            size_t parse();
+            size_t parse(bool forceNewline);
 
             /** Create a new RawCSVDataPtr for a new chunk of data */
             void reset_data_ptr();
@@ -6105,6 +6144,9 @@ namespace csv {
             size_t& current_row_start() {
                 return this->current_row.data_start;
             }
+
+            /** Process a newline during parsing */
+            void processNewline();
 
             void parse_field() noexcept;
 
@@ -6145,7 +6187,6 @@ namespace csv {
                 if (this->eof()) return;
 
                 this->reset_data_ptr();
-                this->data_ptr->_data = std::make_shared<std::string>();
 
                 if (source_size == 0) {
                     const auto start = _source.tellg();
@@ -6158,30 +6199,52 @@ namespace csv {
 
                 // Read data into buffer
                 size_t length = std::min(source_size - stream_pos, bytes);
-                std::unique_ptr<char[]> buff(new char[length]);
-                _source.seekg(stream_pos, std::ios::beg);
-                _source.read(buff.get(), length);
-                stream_pos = _source.tellg();
-                ((std::string*)(this->data_ptr->_data.get()))->assign(buff.get(), length);
-
-                // Create string_view
-                this->data_ptr->data = *((std::string*)this->data_ptr->_data.get());
+                stream_pos = this->data_ptr->CreateStringSource(_source, stream_pos, length);
 
                 // Parse
                 this->current_row = CSVRow(this->data_ptr);
-                size_t remainder = this->parse();
+                bool forceNewline = (stream_pos + bytes >= source_size);
+                size_t completed = this->parse(forceNewline);
+                this->stream_pos -= (length - completed);
 
-                if (stream_pos == source_size || no_chunk()) {
+                // TODO - no_chunk uses a hardcoded ITERATION_CHUNK_SIZE, which
+                // isn't always accurate. One example is for get_csv_head().
+                // no_chunk() is required for get_csv_head() to succeed.
+                if (stream_pos == source_size || no_chunk(bytes)) {
                     this->_eof = true;
                     this->end_feed();
-                }
-                else {
-                    this->stream_pos -= (length - remainder);
                 }
             }
 
         private:
             TStream _source;
+            size_t stream_pos = 0;
+        };
+
+        /** A class for parsing CSV data from a `std::stringstream`
+         *  or an `std::ifstream`
+         */
+        class StringViewParser : public IBasicCSVParser {
+            using RowCollection = ThreadSafeDeque<CSVRow>;
+
+        public:
+            StringViewParser(std::string_view source,
+                const CSVFormat& format,
+                const ColNamesPtr& col_names = nullptr
+            ) : IBasicCSVParser(format, col_names), _source(std::move(source)) {};
+
+            StringViewParser(
+                std::string_view& source,
+                internals::ParseFlagMap parse_flags,
+                internals::WhitespaceMap ws_flags) :
+                IBasicCSVParser(parse_flags, ws_flags),
+                _source(std::move(source))
+            {};
+
+            CSV_INLINE void next(size_t bytes = ITERATION_CHUNK_SIZE) override;
+
+        private:
+            std::string_view _source;
             size_t stream_pos = 0;
         };
 
@@ -6417,8 +6480,8 @@ namespace csv {
 
         /** Read initial chunk to get metadata */
         void initial_read() {
-            this->read_csv_worker = std::thread(&CSVReader::read_csv, this, internals::ITERATION_CHUNK_SIZE);
-            this->read_csv_worker.join();
+            // Read directly so that we don't have to wait for a thread to start.
+            read_csv(1 << 20);
         }
 
         void trim_header();
@@ -6499,13 +6562,37 @@ namespace csv {
     };
 
     /** @name Shorthand Parsing Functions
-     *  @brief Convienience functions for parsing small strings
+     *  @brief Convenience functions for parsing small strings
      */
      ///@{
     CSVReader operator ""_csv(const char*, size_t);
     CSVReader operator ""_csv_no_header(const char*, size_t);
     CSVReader parse(csv::string_view in, CSVFormat format = CSVFormat());
+    CSVReader parse(std::istream& stream, CSVFormat format = CSVFormat());
     CSVReader parse_no_header(csv::string_view in);
+    CSVReader parse_no_header(std::istream& stream);
+
+    /** Shorthand function for parsing streams
+     *
+     *  @return A collection of CSVRow objects
+     *
+     *  @par Example
+     *  @snippet tests/test_read_csv.cpp Parse Example
+     */
+    template<typename TStream,
+        csv::enable_if_t<std::is_base_of<std::istream, TStream>::value, int> = 0>
+    CSVReader parse(TStream& source, CSVFormat format) {
+        return CSVReader(stream, format);
+    }
+
+    template<typename TStream,
+        csv::enable_if_t<std::is_base_of<std::istream, TStream>::value, int> = 0>
+    CSVReader parse_no_header(std::istream& stream) {
+        CSVFormat format;
+        format.header_row(-1);
+
+        return parse(stream, format);
+    }
     ///@}
 
     /** @name Utility Functions */
@@ -6566,6 +6653,10 @@ namespace csv {
             csv::enable_if_t<std::is_floating_point<T>::value, int> = 0
         >
             inline std::string to_string(T value) {
+#ifdef __clang__
+            return std::to_string(value);
+#else
+            // TODO: Figure out why the below code doesn't work on clang
                 std::string result;
 
                 T integral_part;
@@ -6601,6 +6692,7 @@ namespace csv {
                 }
 
                 return result;
+#endif
         }
     }
 
@@ -6608,9 +6700,11 @@ namespace csv {
      *
      *  @param  precision   Number of decimal places
      */
+#ifndef __clang___
     inline static void set_decimal_places(int precision) {
         internals::DECIMAL_PLACES = precision;
     }
+#endif
 
     /** @name CSV Writing */
     ///@{
@@ -6866,6 +6960,10 @@ namespace csv {
     namespace internals {
         CSV_INLINE size_t get_file_size(csv::string_view filename) {
             std::ifstream infile(std::string(filename), std::ios::binary);
+            if (!infile) {
+                throw std::runtime_error("Cannot open file " + std::string(filename));
+            }
+
             const auto start = infile.tellg();
             infile.seekg(0, std::ios::end);
             const auto end = infile.tellg();
@@ -6882,6 +6980,10 @@ namespace csv {
 
             std::error_code error;
             size_t length = std::min((size_t)file_size, bytes);
+            if (length == 0) {
+                return "";
+            }
+
             auto mmap = mio::make_mmap_source(std::string(filename), 0, length, error);
 
             if (error) {
@@ -6914,7 +7016,7 @@ namespace csv {
             using internals::ParseFlags;
 
             bool empty_last_field = this->data_ptr
-                && this->data_ptr->_data
+                && (this->data_ptr->_dataString || data_ptr->_dataMmap)
                 && !this->data_ptr->data.empty()
                 && parse_flag(this->data_ptr->data.back()) == ParseFlags::DELIMITER;
 
@@ -6979,8 +7081,18 @@ namespace csv {
             field_length = 0;
         }
 
+        CSV_INLINE void IBasicCSVParser::processNewline()
+        {
+            // End of record -> Write record
+            this->push_field();
+            this->push_row();
+
+            // Reset
+            this->current_row = CSVRow(data_ptr, this->data_pos, fields->size());
+        }
+
         /** @return The number of characters parsed that belong to complete rows */
-        CSV_INLINE size_t IBasicCSVParser::parse()
+        CSV_INLINE size_t IBasicCSVParser::parse(bool forceNewline)
         {
             using internals::ParseFlags;
 
@@ -6999,17 +7111,14 @@ namespace csv {
 
                 case ParseFlags::NEWLINE:
                     this->data_pos++;
-
-                    // Catches CRLF (or LFLF)
+                    // Skip past a two-character CRLF (or LFLF)
+                    // There's a corner case if the CRLF/LFLF is split across two chunks.
+                    // That's handled elsewhere by ignoring a newline at the beginning of
+                    // a chunk after the first chunk.
                     if (this->data_pos < in.size() && parse_flag(in[this->data_pos]) == ParseFlags::NEWLINE)
                         this->data_pos++;
 
-                    // End of record -> Write record
-                    this->push_field();
-                    this->push_row();
-
-                    // Reset
-                    this->current_row = CSVRow(data_ptr, this->data_pos, fields->size());
+                    processNewline();
                     break;
 
                 case ParseFlags::NOT_SPECIAL:
@@ -7057,6 +7166,10 @@ namespace csv {
                 }
             }
 
+            if (forceNewline && this->data_pos > 0 && compound_parse_flag(in[this->data_pos-1]) != ParseFlags::NEWLINE) {
+                processNewline();
+            }
+
             return this->current_row_start();
         }
 
@@ -7091,34 +7204,61 @@ namespace csv {
 #ifdef _MSC_VER
 #pragma region Specializations
 #endif
+        CSV_INLINE void StringViewParser::next(size_t bytes /* = ITERATION_CHUNK_SIZE*/) {
+            if (this->eof()) return;
+
+            this->reset_data_ptr();
+
+            if (source_size == 0) {
+                source_size = _source.size();
+            }
+
+            // Read data into buffer
+            size_t length = std::min(source_size - stream_pos, bytes);
+
+            stream_pos = this->data_ptr->CreateStringViewSource(_source, stream_pos, length);
+
+            // Parse
+            this->current_row = CSVRow(this->data_ptr);
+            bool forceNewline = (stream_pos + bytes >= source_size);
+            size_t completed = this->parse(forceNewline);
+            this->stream_pos -= (length - completed);
+
+            // TODO - no_chunk uses a hardcoded ITERATION_CHUNK_SIZE, which
+            // isn't always accurate. One example is for get_csv_head().
+            // no_chunk() is required for get_csv_head() to succeed.
+            if (stream_pos == source_size || no_chunk(bytes)) {
+                this->_eof = true;
+                this->end_feed();
+            }
+        }
+
         CSV_INLINE void MmapParser::next(size_t bytes = ITERATION_CHUNK_SIZE) {
             // Reset parser state
             this->field_start = UNINITIALIZED_FIELD;
             this->field_length = 0;
             this->reset_data_ptr();
 
-            // Create memory map
             size_t length = std::min(this->source_size - this->mmap_pos, bytes);
-            std::error_code error;
-            this->data_ptr->_data = std::make_shared<mio::basic_mmap_source<char>>(mio::make_mmap_source(this->_filename, this->mmap_pos, length, error));
-            this->mmap_pos += length;
-            if (error) throw error;
+            if (length > 0) {
+                // Create memory map
+                this->mmap_pos = this->data_ptr->CreateMmapSource(this->_filename, this->mmap_pos, length);
 
-            auto mmap_ptr = (mio::basic_mmap_source<char>*)(this->data_ptr->_data.get());
+                // Parse
+                this->current_row = CSVRow(this->data_ptr);
+                // If we are at the end of the file, parse the last line even if there's no newline
+                bool forceNewline = length < bytes;
+                size_t completed = this->parse(forceNewline);
+                this->mmap_pos -= (length - completed);
+            }
 
-            // Create string view
-            this->data_ptr->data = csv::string_view(mmap_ptr->data(), mmap_ptr->length());
-
-            // Parse
-            this->current_row = CSVRow(this->data_ptr);
-            size_t remainder = this->parse();            
-
-            if (this->mmap_pos == this->source_size || no_chunk()) {
+            // TODO - no_chunk uses a hardcoded ITERATION_CHUNK_SIZE, which
+            // isn't always accurate. One example is for get_csv_head().
+            // no_chunk() is required for get_csv_head() to succeed.
+            if (this->mmap_pos == this->source_size || no_chunk(bytes)) {
                 this->_eof = true;
                 this->end_feed();
             }
-
-            this->mmap_pos -= (length - remainder);
         }
 #ifdef _MSC_VER
 #pragma endregion
@@ -7275,10 +7415,9 @@ namespace csv {
         CSV_INLINE std::vector<std::string> _get_col_names(csv::string_view head, CSVFormat format) {
             // Parse the CSV
             auto trim_chars = format.get_trim_chars();
-            std::stringstream source(head.data());
             RowCollection rows;
 
-            StreamParser<std::stringstream> parser(source, format);
+            StringViewParser parser(head, format);
             parser.set_output(rows);
             parser.next();
 
@@ -7292,11 +7431,10 @@ namespace csv {
             // Map row lengths to row num where they first occurred
             std::unordered_map<size_t, size_t> row_when = { { 0, 0 } };
 
-            // Parse the CSV
-            std::stringstream source(head.data());
             RowCollection rows;
 
-            StreamParser<std::stringstream> parser(source, format);
+            // Parse the CSV
+            StringViewParser parser(head, format);
             parser.set_output(rows);
             parser.next();
 
@@ -7422,7 +7560,7 @@ namespace csv {
         CSVFormat new_format = this->_format;
 
         // Since users are normally not allowed to set
-        // column names and header row simulatenously,
+        // column names and header row simultaneously,
         // we will set the backing variables directly here
         new_format.col_names = this->col_names->get_col_names();
         new_format.header = this->_format.header;
@@ -7624,6 +7762,7 @@ namespace csv {
 #include <cassert>
 #include <functional>
 
+
 namespace csv {
     namespace internals {
         CSV_INLINE RawCSVField& CSVFieldList::operator[](size_t n) const {
@@ -7638,9 +7777,30 @@ namespace csv {
             _current_buffer_size = 0;
             _back = &(buffers.back()[0]);
         }
+
+        class CSVBasicMMapSource : public mio::basic_mmap_source<char>
+        {
+        public:
+#ifdef CSV_HAS_CXX14
+            using mio::basic_mmap_source<char>::basic_mmap_source;
+#else // not CSV_HAS_CXX14
+            CSVBasicMMapSource(const std::string& path, const size_type offset, const size_type length)
+                : mio::basic_mmap_source<char>(path, offset, length)
+            {}
+#endif // not CSV_HAS_CXX14
+        };
+
+        // If there's a file or mapping error, then basic_mmap throws std::system_error.
+        CSV_INLINE size_t RawCSVData::CreateMmapSource(const std::string& filename, size_t mmap_pos, size_t length)
+        {
+            this->_dataMmap = std::make_shared<CSVBasicMMapSource>(filename, mmap_pos, length);
+            // Create string_view onto the mmap
+            this->data = csv::string_view(this->_dataMmap->data(), this->_dataMmap->length());
+            return mmap_pos + length;
+        }
     }
 
-    /** Return a CSVField object corrsponding to the nth value in the row.
+    /** Return a CSVField object corresponding to the nth value in the row.
      *
      *  @note This method performs bounds checking, and will throw an
      *        `std::runtime_error` if n is invalid.

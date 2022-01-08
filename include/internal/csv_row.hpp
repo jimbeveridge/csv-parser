@@ -114,15 +114,17 @@ namespace csv {
             void allocate();
         };
 
+        class CSVBasicMMapSource;
 
         /** A class for storing raw CSV data and associated metadata */
         struct RawCSVData {
-            std::shared_ptr<void> _data = nullptr;
+            std::shared_ptr<CSVBasicMMapSource> _dataMmap;
+            std::shared_ptr<std::string> _dataString;
             csv::string_view data = "";
 
             internals::CSVFieldList fields;
 
-            std::unordered_set<size_t> has_double_quotes = {};
+            std::unordered_set<size_t> has_double_quotes;
 
             // TODO: Consider replacing with a more thread-safe structure
             std::unordered_map<size_t, std::string> double_quote_fields = {};
@@ -130,6 +132,43 @@ namespace csv {
             internals::ColNamesPtr col_names = nullptr;
             internals::ParseFlagMap parse_flags;
             internals::WhitespaceMap ws_flags;
+            size_t CreateMmapSource(const std::string& filename, size_t mmap_pos, size_t length);
+
+            size_t CreateStringViewSource(std::string_view source, size_t stream_pos, size_t length)
+            {
+                source.remove_prefix(stream_pos);
+                if (length < source.size()) {
+                    source.remove_suffix(source.size() - length);
+                }
+
+                // Create string_view onto the string
+                this->data = source;
+                return stream_pos + length;
+            }
+
+            size_t CreateStringSource(std::string&& source, size_t stream_pos, size_t length)
+            {
+                this->_dataString = std::make_shared<std::string>(std::move(source));
+                this->_dataString->resize(length);
+
+                // Create string_view onto the string
+                this->data = *this->_dataString.get();
+                return stream_pos + length;
+            }
+
+            template<typename TStream>
+            size_t CreateStringSource(TStream& source, size_t stream_pos, size_t length)
+            {
+                std::shared_ptr<std::string> str = std::make_shared<std::string>(length, ' ');
+                source.seekg(stream_pos, std::ios::beg);
+                source.read(str->data(), length);
+                size_t new_stream_pos = source.tellg();
+                this->_dataString = str;
+
+                // Create string_view onto the string
+                this->data = *str.get();
+                return new_stream_pos;
+            }
         };
 
         using RawCSVDataPtr = std::shared_ptr<RawCSVData>;

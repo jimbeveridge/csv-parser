@@ -4,6 +4,10 @@ namespace csv {
     namespace internals {
         CSV_INLINE size_t get_file_size(csv::string_view filename) {
             std::ifstream infile(std::string(filename), std::ios::binary);
+            if (!infile) {
+                throw std::runtime_error("Cannot open file " + std::string(filename));
+            }
+
             const auto start = infile.tellg();
             infile.seekg(0, std::ios::end);
             const auto end = infile.tellg();
@@ -20,6 +24,10 @@ namespace csv {
 
             std::error_code error;
             size_t length = std::min((size_t)file_size, bytes);
+            if (length == 0) {
+                return "";
+            }
+
             auto mmap = mio::make_mmap_source(std::string(filename), 0, length, error);
 
             if (error) {
@@ -52,7 +60,7 @@ namespace csv {
             using internals::ParseFlags;
 
             bool empty_last_field = this->data_ptr
-                && this->data_ptr->_data
+                && (this->data_ptr->_dataString || data_ptr->_dataMmap)
                 && !this->data_ptr->data.empty()
                 && parse_flag(this->data_ptr->data.back()) == ParseFlags::DELIMITER;
 
@@ -117,8 +125,18 @@ namespace csv {
             field_length = 0;
         }
 
+        CSV_INLINE void IBasicCSVParser::processNewline()
+        {
+            // End of record -> Write record
+            this->push_field();
+            this->push_row();
+
+            // Reset
+            this->current_row = CSVRow(data_ptr, this->data_pos, fields->size());
+        }
+
         /** @return The number of characters parsed that belong to complete rows */
-        CSV_INLINE size_t IBasicCSVParser::parse()
+        CSV_INLINE size_t IBasicCSVParser::parse(bool forceNewline)
         {
             using internals::ParseFlags;
 
@@ -137,17 +155,14 @@ namespace csv {
 
                 case ParseFlags::NEWLINE:
                     this->data_pos++;
-
-                    // Catches CRLF (or LFLF)
+                    // Skip past a two-character CRLF (or LFLF)
+                    // There's a corner case if the CRLF/LFLF is split across two chunks.
+                    // That's handled elsewhere by ignoring a newline at the beginning of
+                    // a chunk after the first chunk.
                     if (this->data_pos < in.size() && parse_flag(in[this->data_pos]) == ParseFlags::NEWLINE)
                         this->data_pos++;
 
-                    // End of record -> Write record
-                    this->push_field();
-                    this->push_row();
-
-                    // Reset
-                    this->current_row = CSVRow(data_ptr, this->data_pos, fields->size());
+                    processNewline();
                     break;
 
                 case ParseFlags::NOT_SPECIAL:
@@ -195,6 +210,10 @@ namespace csv {
                 }
             }
 
+            if (forceNewline && this->data_pos > 0 && compound_parse_flag(in[this->data_pos-1]) != ParseFlags::NEWLINE) {
+                processNewline();
+            }
+
             return this->current_row_start();
         }
 
@@ -229,34 +248,61 @@ namespace csv {
 #ifdef _MSC_VER
 #pragma region Specializations
 #endif
+        CSV_INLINE void StringViewParser::next(size_t bytes /* = ITERATION_CHUNK_SIZE*/) {
+            if (this->eof()) return;
+
+            this->reset_data_ptr();
+
+            if (source_size == 0) {
+                source_size = _source.size();
+            }
+
+            // Read data into buffer
+            size_t length = std::min(source_size - stream_pos, bytes);
+
+            stream_pos = this->data_ptr->CreateStringViewSource(_source, stream_pos, length);
+
+            // Parse
+            this->current_row = CSVRow(this->data_ptr);
+            bool forceNewline = (stream_pos + bytes >= source_size);
+            size_t completed = this->parse(forceNewline);
+            this->stream_pos -= (length - completed);
+
+            // TODO - no_chunk uses a hardcoded ITERATION_CHUNK_SIZE, which
+            // isn't always accurate. One example is for get_csv_head().
+            // no_chunk() is required for get_csv_head() to succeed.
+            if (stream_pos == source_size || no_chunk(bytes)) {
+                this->_eof = true;
+                this->end_feed();
+            }
+        }
+
         CSV_INLINE void MmapParser::next(size_t bytes = ITERATION_CHUNK_SIZE) {
             // Reset parser state
             this->field_start = UNINITIALIZED_FIELD;
             this->field_length = 0;
             this->reset_data_ptr();
 
-            // Create memory map
             size_t length = std::min(this->source_size - this->mmap_pos, bytes);
-            std::error_code error;
-            this->data_ptr->_data = std::make_shared<mio::basic_mmap_source<char>>(mio::make_mmap_source(this->_filename, this->mmap_pos, length, error));
-            this->mmap_pos += length;
-            if (error) throw error;
+            if (length > 0) {
+                // Create memory map
+                this->mmap_pos = this->data_ptr->CreateMmapSource(this->_filename, this->mmap_pos, length);
 
-            auto mmap_ptr = (mio::basic_mmap_source<char>*)(this->data_ptr->_data.get());
+                // Parse
+                this->current_row = CSVRow(this->data_ptr);
+                // If we are at the end of the file, parse the last line even if there's no newline
+                bool forceNewline = length < bytes;
+                size_t completed = this->parse(forceNewline);
+                this->mmap_pos -= (length - completed);
+            }
 
-            // Create string view
-            this->data_ptr->data = csv::string_view(mmap_ptr->data(), mmap_ptr->length());
-
-            // Parse
-            this->current_row = CSVRow(this->data_ptr);
-            size_t remainder = this->parse();            
-
-            if (this->mmap_pos == this->source_size || no_chunk()) {
+            // TODO - no_chunk uses a hardcoded ITERATION_CHUNK_SIZE, which
+            // isn't always accurate. One example is for get_csv_head().
+            // no_chunk() is required for get_csv_head() to succeed.
+            if (this->mmap_pos == this->source_size || no_chunk(bytes)) {
                 this->_eof = true;
                 this->end_feed();
             }
-
-            this->mmap_pos -= (length - remainder);
         }
 #ifdef _MSC_VER
 #pragma endregion

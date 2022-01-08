@@ -246,13 +246,13 @@ namespace csv {
             ///@}
 
             /** Whether or not source needs to be read in chunks */
-            CONSTEXPR bool no_chunk() const { return this->source_size < ITERATION_CHUNK_SIZE; }
+            CONSTEXPR bool no_chunk(size_t bytes) const { return this->source_size < bytes; }
 
             /** Parse the current chunk of data *
              *
              *  @returns How many character were read that are part of complete rows
              */
-            size_t parse();
+            size_t parse(bool forceNewline);
 
             /** Create a new RawCSVDataPtr for a new chunk of data */
             void reset_data_ptr();
@@ -281,6 +281,9 @@ namespace csv {
             size_t& current_row_start() {
                 return this->current_row.data_start;
             }
+
+            /** Process a newline during parsing */
+            void processNewline();
 
             void parse_field() noexcept;
 
@@ -321,7 +324,6 @@ namespace csv {
                 if (this->eof()) return;
 
                 this->reset_data_ptr();
-                this->data_ptr->_data = std::make_shared<std::string>();
 
                 if (source_size == 0) {
                     const auto start = _source.tellg();
@@ -334,30 +336,52 @@ namespace csv {
 
                 // Read data into buffer
                 size_t length = std::min(source_size - stream_pos, bytes);
-                std::unique_ptr<char[]> buff(new char[length]);
-                _source.seekg(stream_pos, std::ios::beg);
-                _source.read(buff.get(), length);
-                stream_pos = _source.tellg();
-                ((std::string*)(this->data_ptr->_data.get()))->assign(buff.get(), length);
-
-                // Create string_view
-                this->data_ptr->data = *((std::string*)this->data_ptr->_data.get());
+                stream_pos = this->data_ptr->CreateStringSource(_source, stream_pos, length);
 
                 // Parse
                 this->current_row = CSVRow(this->data_ptr);
-                size_t remainder = this->parse();
+                bool forceNewline = (stream_pos + bytes >= source_size);
+                size_t completed = this->parse(forceNewline);
+                this->stream_pos -= (length - completed);
 
-                if (stream_pos == source_size || no_chunk()) {
+                // TODO - no_chunk uses a hardcoded ITERATION_CHUNK_SIZE, which
+                // isn't always accurate. One example is for get_csv_head().
+                // no_chunk() is required for get_csv_head() to succeed.
+                if (stream_pos == source_size || no_chunk(bytes)) {
                     this->_eof = true;
                     this->end_feed();
-                }
-                else {
-                    this->stream_pos -= (length - remainder);
                 }
             }
 
         private:
             TStream _source;
+            size_t stream_pos = 0;
+        };
+
+        /** A class for parsing CSV data from a `std::stringstream`
+         *  or an `std::ifstream`
+         */
+        class StringViewParser : public IBasicCSVParser {
+            using RowCollection = ThreadSafeDeque<CSVRow>;
+
+        public:
+            StringViewParser(std::string_view source,
+                const CSVFormat& format,
+                const ColNamesPtr& col_names = nullptr
+            ) : IBasicCSVParser(format, col_names), _source(std::move(source)) {};
+
+            StringViewParser(
+                std::string_view& source,
+                internals::ParseFlagMap parse_flags,
+                internals::WhitespaceMap ws_flags) :
+                IBasicCSVParser(parse_flags, ws_flags),
+                _source(std::move(source))
+            {};
+
+            CSV_INLINE void next(size_t bytes = ITERATION_CHUNK_SIZE) override;
+
+        private:
+            std::string_view _source;
             size_t stream_pos = 0;
         };
 

@@ -19,13 +19,37 @@ namespace csv {
     };
 
     /** @name Shorthand Parsing Functions
-     *  @brief Convienience functions for parsing small strings
+     *  @brief Convenience functions for parsing small strings
      */
      ///@{
     CSVReader operator ""_csv(const char*, size_t);
     CSVReader operator ""_csv_no_header(const char*, size_t);
     CSVReader parse(csv::string_view in, CSVFormat format = CSVFormat());
+    CSVReader parse(std::istream& stream, CSVFormat format = CSVFormat());
     CSVReader parse_no_header(csv::string_view in);
+    CSVReader parse_no_header(std::istream& stream);
+
+    /** Shorthand function for parsing streams
+     *
+     *  @return A collection of CSVRow objects
+     *
+     *  @par Example
+     *  @snippet tests/test_read_csv.cpp Parse Example
+     */
+    template<typename TStream,
+        csv::enable_if_t<std::is_base_of<std::istream, TStream>::value, int> = 0>
+    CSVReader parse(TStream& source, CSVFormat format) {
+        return CSVReader(stream, format);
+    }
+
+    template<typename TStream,
+        csv::enable_if_t<std::is_base_of<std::istream, TStream>::value, int> = 0>
+    CSVReader parse_no_header(std::istream& stream) {
+        CSVFormat format;
+        format.header_row(-1);
+
+        return parse(stream, format);
+    }
     ///@}
 
     /** @name Utility Functions */

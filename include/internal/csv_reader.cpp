@@ -28,10 +28,9 @@ namespace csv {
         CSV_INLINE std::vector<std::string> _get_col_names(csv::string_view head, CSVFormat format) {
             // Parse the CSV
             auto trim_chars = format.get_trim_chars();
-            std::stringstream source(head.data());
             RowCollection rows;
 
-            StreamParser<std::stringstream> parser(source, format);
+            StringViewParser parser(head, format);
             parser.set_output(rows);
             parser.next();
 
@@ -45,11 +44,10 @@ namespace csv {
             // Map row lengths to row num where they first occurred
             std::unordered_map<size_t, size_t> row_when = { { 0, 0 } };
 
-            // Parse the CSV
-            std::stringstream source(head.data());
             RowCollection rows;
 
-            StreamParser<std::stringstream> parser(source, format);
+            // Parse the CSV
+            StringViewParser parser(head, format);
             parser.set_output(rows);
             parser.next();
 
@@ -175,7 +173,7 @@ namespace csv {
         CSVFormat new_format = this->_format;
 
         // Since users are normally not allowed to set
-        // column names and header row simulatenously,
+        // column names and header row simultaneously,
         // we will set the backing variables directly here
         new_format.col_names = this->col_names->get_col_names();
         new_format.header = this->_format.header;

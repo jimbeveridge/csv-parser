@@ -5,6 +5,8 @@
 #include <cassert>
 #include <functional>
 #include "csv_row.hpp"
+#include "./external/mio.hpp"
+
 
 namespace csv {
     namespace internals {
@@ -20,9 +22,30 @@ namespace csv {
             _current_buffer_size = 0;
             _back = &(buffers.back()[0]);
         }
+
+        class CSVBasicMMapSource : public mio::basic_mmap_source<char>
+        {
+        public:
+#ifdef CSV_HAS_CXX14
+            using mio::basic_mmap_source<char>::basic_mmap_source;
+#else // not CSV_HAS_CXX14
+            CSVBasicMMapSource(const std::string& path, const size_type offset, const size_type length)
+                : mio::basic_mmap_source<char>(path, offset, length)
+            {}
+#endif // not CSV_HAS_CXX14
+        };
+
+        // If there's a file or mapping error, then basic_mmap throws std::system_error.
+        CSV_INLINE size_t RawCSVData::CreateMmapSource(const std::string& filename, size_t mmap_pos, size_t length)
+        {
+            this->_dataMmap = std::make_shared<CSVBasicMMapSource>(filename, mmap_pos, length);
+            // Create string_view onto the mmap
+            this->data = csv::string_view(this->_dataMmap->data(), this->_dataMmap->length());
+            return mmap_pos + length;
+        }
     }
 
-    /** Return a CSVField object corrsponding to the nth value in the row.
+    /** Return a CSVField object corresponding to the nth value in the row.
      *
      *  @note This method performs bounds checking, and will throw an
      *        `std::runtime_error` if n is invalid.

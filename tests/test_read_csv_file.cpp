@@ -7,6 +7,14 @@
 #include "catch.hpp"
 #include "csv.hpp"
 
+constexpr char kTempCsv[] = "temp.csv";
+
+class Deleter
+{
+public:
+	~Deleter() { remove(kTempCsv); }
+} deleter;
+
 using namespace csv;
 using std::vector;
 using std::string;
@@ -46,7 +54,7 @@ TEST_CASE("Prevent Column Names From Being Overwritten", "[csv_col_names_overwri
 TEST_CASE("get_file_info() Test", "[test_file_info]") {
     CSVFileInfo info = get_file_info(
         "./tests/data/real_data/2009PowerStatus.txt");
-        
+
     REQUIRE(info.delim == '|');
     REQUIRE(info.n_rows == 37960); // Can confirm with Excel
     REQUIRE(info.n_cols == 3);
@@ -156,4 +164,52 @@ TEST_CASE("Test read_row() CSVField - Power Status", "[read_row_csvf3]") {
             REQUIRE(row[unit].get<std::string>() == "Beaver Valley 1");
         }
     }
+}
+
+
+/* Ensure reading empty CSVs does not cause errors
+ *
+ * Reported in:
+ *  - https://github.com/vincentlaucsb/csv-parser/issues/116
+ *  - https://github.com/vincentlaucsb/csv-parser/issues/121
+ */
+TEST_CASE("Empty CSV file", "[read_empty_csv_file]") {
+    std::ofstream output(kTempCsv, std::ios::out | std::ofstream::trunc);
+
+    CSVReader reader(kTempCsv);
+    REQUIRE(reader.empty());
+
+    for (auto& row : reader) {
+        (void)row;
+    }
+
+    // We want to make sure that no exceptions are thrown
+    REQUIRE(reader.n_rows() == 0);
+}
+
+
+/* Ensure reading a file that's not terminated with a newline
+ */
+TEST_CASE("No trailing newline", "[read_no_ending_newline]") {
+    {
+        std::ofstream file(kTempCsv, std::ios::out | std::ofstream::trunc);
+        file << "123, 234, 345";
+    }
+
+    CSVFormat format;
+    format.header_row(-1);
+
+    CSVReader reader1(kTempCsv, format);
+    CSVRow row;
+    REQUIRE(reader1.read_row(row));
+
+    CSVReader reader2(kTempCsv, format);
+    int count = 0;
+    for (auto& row : reader2) {
+        ++count;
+        (void)row;
+    }
+
+    // We want to make sure that no exceptions are thrown
+    REQUIRE(count == 1);
 }
