@@ -5028,7 +5028,7 @@ namespace csv {
         std::vector<char> possible_delimiters = { ',' };
 
         /**< Set of whitespace characters to trim */
-        std::vector<char> trim_chars = {};
+        std::vector<char> trim_chars;
 
         /**< Row number with columns (ignored if col_names is non-empty) */
         int header = 0;
@@ -5040,7 +5040,7 @@ namespace csv {
         char quote_char = '"';
 
         /**< Should be left empty unless file doesn't include header */
-        std::vector<std::string> col_names = {};
+        std::vector<std::string> col_names;
 
         /**< Allow variable length columns? */
         VariableColumnPolicy variable_column_policy = VariableColumnPolicy::IGNORE_ROW;
@@ -7351,7 +7351,7 @@ namespace csv {
                 this->trim_chars.begin(), this->trim_chars.end());
 
         // Stores intersection of possible delimiters and trim characters
-        std::vector<char> intersection = {};
+        std::vector<char> intersection;
 
         // Find which characters overlap, if any
         std::set_intersection(

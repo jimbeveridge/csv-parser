@@ -55,7 +55,7 @@ namespace csv {
                 this->trim_chars.begin(), this->trim_chars.end());
 
         // Stores intersection of possible delimiters and trim characters
-        std::vector<char> intersection = {};
+        std::vector<char> intersection;
 
         // Find which characters overlap, if any
         std::set_intersection(
