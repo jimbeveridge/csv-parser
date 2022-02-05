@@ -5,17 +5,43 @@
 #include "csv_reader.hpp"
 
 namespace csv {
+    CSV_INLINE bool CSVReader::read_row(CSVRow& row) {
+        bool b{};
+        for (;;) {
+            b = this->parser->queue_reader.read_row(row);
+            if (!b) {
+                break;
+            }
+            if (row.size() == this->n_cols) {
+                ++_n_data_rows;
+                break;
+            }
+            switch (this->_format.variable_column_policy) {
+            case VariableColumnPolicy::KEEP:
+                ++_n_data_rows;
+                return true;
+
+            case VariableColumnPolicy::IGNORE_ROW:
+                continue;
+
+            case VariableColumnPolicy::THROW:
+                if (row.size() < this->n_cols)
+                    throw std::runtime_error("Line too short " + internals::format_row(row));
+
+                throw std::runtime_error("Line too long " + internals::format_row(row));
+            }
+        }
+        return b;
+    }
+
     /** Return an iterator to the first row in the reader */
     CSV_INLINE CSVReader::iterator CSVReader::begin() {
-        if (this->records->empty()) {
-            this->read_csv_worker = std::thread(&CSVReader::read_csv, this, internals::ITERATION_CHUNK_SIZE);
-            this->read_csv_worker.join();
-
-            // Still empty => return end iterator
-            if (this->records->empty()) return this->end();
+        CSVRow row;
+        if (!read_row(row)) {
+            return this->end();
         }
 
-        CSVReader::iterator ret(this, this->records->pop_front());
+        CSVReader::iterator ret(this, std::move(row));
         return ret;
     }
 

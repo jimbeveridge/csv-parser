@@ -161,6 +161,9 @@ def header_collate(headers: list):
 
         with open(str(path), mode='r') as infile:
             for line in infile:
+                if line.startswith('\xef\xbb\xbf'):
+                    line = line[3:]
+
                 # Add local includes to MISSING_INCLUDES
                 local_include = re.search('^#include "(?P<file>.*)"', line)
                 if local_include:

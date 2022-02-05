@@ -21,11 +21,12 @@ namespace csv {
     namespace internals {
         class IBasicCSVParser;
 
-        static const std::string ERROR_NAN = "Not a number.";
-        static const std::string ERROR_OVERFLOW = "Overflow error.";
-        static const std::string ERROR_FLOAT_TO_INT =
-            "Attempted to convert a floating point value to an integral type.";
-        static const std::string ERROR_NEG_TO_UNSIGNED = "Negative numbers cannot be converted to unsigned types.";
+        const std::string ERROR_NAN { "Not a number." };
+        const std::string ERROR_OVERFLOW { "Overflow error." };
+        const std::string ERROR_FLOAT_TO_INT {
+            "Attempted to convert a floating point value to an integral type." };
+
+        const std::string ERROR_NEG_TO_UNSIGNED{ "Negative numbers cannot be converted to unsigned types." };
     
         std::string json_escape_string(csv::string_view s) noexcept;
 
@@ -51,7 +52,7 @@ namespace csv {
         /** A class used for efficiently storing RawCSVField objects and expanding as necessary
          *
          *  @par Implementation
-         *  This data structure stores RawCSVField in continguous blocks. When more capacity
+         *  This data structure stores RawCSVField in contiguous blocks. When more capacity
          *  is needed, a new block is allocated, but previous data stays put.
          *
          *  @par Thread Safety
@@ -102,7 +103,7 @@ namespace csv {
         private:
             const size_t _single_buffer_capacity;
 
-            std::vector<RawCSVField*> buffers = {};
+            std::vector<RawCSVField*> buffers;
 
             /** Number of items in the current buffer */
             size_t _current_buffer_size = 0;
@@ -122,12 +123,7 @@ namespace csv {
             std::shared_ptr<std::string> _dataString;
             csv::string_view data = "";
 
-            internals::CSVFieldList fields;
-
             std::unordered_set<size_t> has_double_quotes;
-
-            // TODO: Consider replacing with a more thread-safe structure
-            std::unordered_map<size_t, std::string> double_quote_fields = {};
 
             internals::ColNamesPtr col_names = nullptr;
             internals::ParseFlagMap parse_flags;
@@ -349,6 +345,11 @@ namespace csv {
         /** Return the number of fields in this row */
         CONSTEXPR size_t size() const noexcept { return row_length; }
 
+        /** Sent when the sender thread exits to wake up the receiver.
+         *  All rows may or may not have been sent.
+         */
+        bool tombstone() const { return this->data.get() == nullptr; }
+
         /** @name Value Retrieval */
         ///@{
         CSVField operator[](size_t n) const;
@@ -435,6 +436,10 @@ namespace csv {
         csv::string_view get_field(size_t index) const;
 
         internals::RawCSVDataPtr data;
+
+        std::vector<csv::internals::RawCSVField> fields;
+
+        mutable std::unordered_map<size_t, std::string> double_quote_fields;
 
         /** Where in RawCSVData.data we start */
         size_t data_start = 0;

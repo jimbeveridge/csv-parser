@@ -35,13 +35,10 @@ SOFTWARE.
 
 
 #include <algorithm>
-#include <deque>
-#include <fstream>
+#include <istream>
 #include <iterator>
 #include <memory>
-#include <mutex>
 #include <thread>
-#include <sstream>
 #include <string>
 #include <vector>
 
@@ -1796,19 +1793,1064 @@ using shared_ummap_sink = basic_shared_mmap_sink<unsigned char>;
 
 #endif // MIO_SHARED_MMAP_HEADER
 
+// ©2020 Cameron Desrochers.
+// Distributed under the simplified BSD license (see the license file that
+// should have come with this header).
+
+// Provides a C++11 implementation of a single-producer, single-consumer wait-free concurrent
+// circular buffer (fixed-size queue).
+
+
+#include <utility>
+#include <chrono>
+#include <memory>
+#include <cstdlib>
+#include <cstdint>
+#include <cassert>
+
+// Note that this implementation is fully modern C++11 (not compatible with old MSVC versions)
+// but we still include atomicops.h for its LightweightSemaphore implementation.
+// ©2013-2016 Cameron Desrochers.
+// Distributed under the simplified BSD license (see the license file that
+// should have come with this header).
+// Uses Jeff Preshing's semaphore implementation (under the terms of its
+// separate zlib license, embedded below).
+
+
+// Provides portable (VC++2010+, Intel ICC 13, GCC 4.7+, and anything C++11 compliant) implementation
+// of low-level memory barriers, plus a few semi-portable utility macros (for inlining and alignment).
+// Also has a basic atomic type (limited to hardware-supported atomics with no memory ordering guarantees).
+// Uses the AE_* prefix for macros (historical reasons), and the "moodycamel" namespace for symbols.
+
+#include <cerrno>
+#include <cassert>
+#include <type_traits>
+#include <cerrno>
+#include <cstdint>
+#include <ctime>
+
+// Platform detection
+#if defined(__INTEL_COMPILER)
+#define AE_ICC
+#elif defined(_MSC_VER)
+#define AE_VCPP
+#elif defined(__GNUC__)
+#define AE_GCC
+#endif
+
+#if defined(_M_IA64) || defined(__ia64__)
+#define AE_ARCH_IA64
+#elif defined(_WIN64) || defined(__amd64__) || defined(_M_X64) || defined(__x86_64__)
+#define AE_ARCH_X64
+#elif defined(_M_IX86) || defined(__i386__)
+#define AE_ARCH_X86
+#elif defined(_M_PPC) || defined(__powerpc__)
+#define AE_ARCH_PPC
+#else
+#define AE_ARCH_UNKNOWN
+#endif
+
+
+// AE_UNUSED
+#define AE_UNUSED(x) ((void)x)
+
+// AE_NO_TSAN/AE_TSAN_ANNOTATE_*
+#if defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#if __cplusplus >= 201703L  // inline variables require C++17
+namespace moodycamel { inline int ae_tsan_global; }
+#define AE_TSAN_ANNOTATE_RELEASE() AnnotateHappensBefore(__FILE__, __LINE__, (void *)(&::moodycamel::ae_tsan_global))
+#define AE_TSAN_ANNOTATE_ACQUIRE() AnnotateHappensAfter(__FILE__, __LINE__, (void *)(&::moodycamel::ae_tsan_global))
+extern "C" void AnnotateHappensBefore(const char*, int, void*);
+extern "C" void AnnotateHappensAfter(const char*, int, void*);
+#else  // when we can't work with tsan, attempt to disable its warnings
+#define AE_NO_TSAN __attribute__((no_sanitize("thread")))
+#endif
+#endif
+#endif
+#ifndef AE_NO_TSAN
+#define AE_NO_TSAN
+#endif
+#ifndef AE_TSAN_ANNOTATE_RELEASE
+#define AE_TSAN_ANNOTATE_RELEASE()
+#define AE_TSAN_ANNOTATE_ACQUIRE()
+#endif
+
+
+// AE_FORCEINLINE
+#if defined(AE_VCPP) || defined(AE_ICC)
+#define AE_FORCEINLINE __forceinline
+#elif defined(AE_GCC)
+//#define AE_FORCEINLINE __attribute__((always_inline)) 
+#define AE_FORCEINLINE inline
+#else
+#define AE_FORCEINLINE inline
+#endif
+
+
+// AE_ALIGN
+#if defined(AE_VCPP) || defined(AE_ICC)
+#define AE_ALIGN(x) __declspec(align(x))
+#elif defined(AE_GCC)
+#define AE_ALIGN(x) __attribute__((aligned(x)))
+#else
+// Assume GCC compliant syntax...
+#define AE_ALIGN(x) __attribute__((aligned(x)))
+#endif
+
+
+// Portable atomic fences implemented below:
+
+namespace moodycamel {
+
+enum memory_order {
+	memory_order_relaxed,
+	memory_order_acquire,
+	memory_order_release,
+	memory_order_acq_rel,
+	memory_order_seq_cst,
+
+	// memory_order_sync: Forces a full sync:
+	// #LoadLoad, #LoadStore, #StoreStore, and most significantly, #StoreLoad
+	memory_order_sync = memory_order_seq_cst
+};
+
+}    // end namespace moodycamel
+
+#if (defined(AE_VCPP) && (_MSC_VER < 1700 || defined(__cplusplus_cli))) || (defined(AE_ICC) && __INTEL_COMPILER < 1600)
+// VS2010 and ICC13 don't support std::atomic_*_fence, implement our own fences
+
+#include <intrin.h>
+
+#if defined(AE_ARCH_X64) || defined(AE_ARCH_X86)
+#define AeFullSync _mm_mfence
+#define AeLiteSync _mm_mfence
+#elif defined(AE_ARCH_IA64)
+#define AeFullSync __mf
+#define AeLiteSync __mf
+#elif defined(AE_ARCH_PPC)
+#include <ppcintrinsics.h>
+#define AeFullSync __sync
+#define AeLiteSync __lwsync
+#endif
+
+
+#ifdef AE_VCPP
+#pragma warning(push)
+#pragma warning(disable: 4365)		// Disable erroneous 'conversion from long to unsigned int, signed/unsigned mismatch' error when using `assert`
+#ifdef __cplusplus_cli
+#pragma managed(push, off)
+#endif
+#endif
+
+namespace moodycamel {
+
+AE_FORCEINLINE void compiler_fence(memory_order order) AE_NO_TSAN
+{
+	switch (order) {
+		case memory_order_relaxed: break;
+		case memory_order_acquire: _ReadBarrier(); break;
+		case memory_order_release: _WriteBarrier(); break;
+		case memory_order_acq_rel: _ReadWriteBarrier(); break;
+		case memory_order_seq_cst: _ReadWriteBarrier(); break;
+		default: assert(false);
+	}
+}
+
+// x86/x64 have a strong memory model -- all loads and stores have
+// acquire and release semantics automatically (so only need compiler
+// barriers for those).
+#if defined(AE_ARCH_X86) || defined(AE_ARCH_X64)
+AE_FORCEINLINE void fence(memory_order order) AE_NO_TSAN
+{
+	switch (order) {
+		case memory_order_relaxed: break;
+		case memory_order_acquire: _ReadBarrier(); break;
+		case memory_order_release: _WriteBarrier(); break;
+		case memory_order_acq_rel: _ReadWriteBarrier(); break;
+		case memory_order_seq_cst:
+			_ReadWriteBarrier();
+			AeFullSync();
+			_ReadWriteBarrier();
+			break;
+		default: assert(false);
+	}
+}
+#else
+AE_FORCEINLINE void fence(memory_order order) AE_NO_TSAN
+{
+	// Non-specialized arch, use heavier memory barriers everywhere just in case :-(
+	switch (order) {
+		case memory_order_relaxed:
+			break;
+		case memory_order_acquire:
+			_ReadBarrier();
+			AeLiteSync();
+			_ReadBarrier();
+			break;
+		case memory_order_release:
+			_WriteBarrier();
+			AeLiteSync();
+			_WriteBarrier();
+			break;
+		case memory_order_acq_rel:
+			_ReadWriteBarrier();
+			AeLiteSync();
+			_ReadWriteBarrier();
+			break;
+		case memory_order_seq_cst:
+			_ReadWriteBarrier();
+			AeFullSync();
+			_ReadWriteBarrier();
+			break;
+		default: assert(false);
+	}
+}
+#endif
+}    // end namespace moodycamel
+#else
+// Use standard library of atomics
+#include <atomic>
+
+namespace moodycamel {
+
+AE_FORCEINLINE void compiler_fence(memory_order order) AE_NO_TSAN
+{
+	switch (order) {
+		case memory_order_relaxed: break;
+		case memory_order_acquire: std::atomic_signal_fence(std::memory_order_acquire); break;
+		case memory_order_release: std::atomic_signal_fence(std::memory_order_release); break;
+		case memory_order_acq_rel: std::atomic_signal_fence(std::memory_order_acq_rel); break;
+		case memory_order_seq_cst: std::atomic_signal_fence(std::memory_order_seq_cst); break;
+		default: assert(false);
+	}
+}
+
+AE_FORCEINLINE void fence(memory_order order) AE_NO_TSAN
+{
+	switch (order) {
+		case memory_order_relaxed: break;
+		case memory_order_acquire: AE_TSAN_ANNOTATE_ACQUIRE(); std::atomic_thread_fence(std::memory_order_acquire); break;
+		case memory_order_release: AE_TSAN_ANNOTATE_RELEASE(); std::atomic_thread_fence(std::memory_order_release); break;
+		case memory_order_acq_rel: AE_TSAN_ANNOTATE_ACQUIRE(); AE_TSAN_ANNOTATE_RELEASE(); std::atomic_thread_fence(std::memory_order_acq_rel); break;
+		case memory_order_seq_cst: AE_TSAN_ANNOTATE_ACQUIRE(); AE_TSAN_ANNOTATE_RELEASE(); std::atomic_thread_fence(std::memory_order_seq_cst); break;
+		default: assert(false);
+	}
+}
+
+}    // end namespace moodycamel
+
+#endif
+
+
+#if !defined(AE_VCPP) || (_MSC_VER >= 1700 && !defined(__cplusplus_cli))
+#define AE_USE_STD_ATOMIC_FOR_WEAK_ATOMIC
+#endif
+
+#ifdef AE_USE_STD_ATOMIC_FOR_WEAK_ATOMIC
+#include <atomic>
+#endif
+#include <utility>
+
+// WARNING: *NOT* A REPLACEMENT FOR std::atomic. READ CAREFULLY:
+// Provides basic support for atomic variables -- no memory ordering guarantees are provided.
+// The guarantee of atomicity is only made for types that already have atomic load and store guarantees
+// at the hardware level -- on most platforms this generally means aligned pointers and integers (only).
+namespace moodycamel {
+template<typename T>
+class weak_atomic
+{
+public:
+	AE_NO_TSAN weak_atomic() : value() { }
+#ifdef AE_VCPP
+#pragma warning(push)
+#pragma warning(disable: 4100)		// Get rid of (erroneous) 'unreferenced formal parameter' warning
+#endif
+	template<typename U> AE_NO_TSAN weak_atomic(U&& x) : value(std::forward<U>(x)) {  }
+#ifdef __cplusplus_cli
+	// Work around bug with universal reference/nullptr combination that only appears when /clr is on
+	AE_NO_TSAN weak_atomic(nullptr_t) : value(nullptr) {  }
+#endif
+	AE_NO_TSAN weak_atomic(weak_atomic const& other) : value(other.load()) {  }
+	AE_NO_TSAN weak_atomic(weak_atomic&& other) : value(std::move(other.load())) {  }
+#ifdef AE_VCPP
+#pragma warning(pop)
+#endif
+
+	AE_FORCEINLINE operator T() const AE_NO_TSAN { return load(); }
+
+	
+#ifndef AE_USE_STD_ATOMIC_FOR_WEAK_ATOMIC
+	template<typename U> AE_FORCEINLINE weak_atomic const& operator=(U&& x) AE_NO_TSAN { value = std::forward<U>(x); return *this; }
+	AE_FORCEINLINE weak_atomic const& operator=(weak_atomic const& other) AE_NO_TSAN { value = other.value; return *this; }
+	
+	AE_FORCEINLINE T load() const AE_NO_TSAN { return value; }
+	
+	AE_FORCEINLINE T fetch_add_acquire(T increment) AE_NO_TSAN
+	{
+#if defined(AE_ARCH_X64) || defined(AE_ARCH_X86)
+		if (sizeof(T) == 4) return _InterlockedExchangeAdd((long volatile*)&value, (long)increment);
+#if defined(_M_AMD64)
+		else if (sizeof(T) == 8) return _InterlockedExchangeAdd64((long long volatile*)&value, (long long)increment);
+#endif
+#else
+#error Unsupported platform
+#endif
+		assert(false && "T must be either a 32 or 64 bit type");
+		return value;
+	}
+	
+	AE_FORCEINLINE T fetch_add_release(T increment) AE_NO_TSAN
+	{
+#if defined(AE_ARCH_X64) || defined(AE_ARCH_X86)
+		if (sizeof(T) == 4) return _InterlockedExchangeAdd((long volatile*)&value, (long)increment);
+#if defined(_M_AMD64)
+		else if (sizeof(T) == 8) return _InterlockedExchangeAdd64((long long volatile*)&value, (long long)increment);
+#endif
+#else
+#error Unsupported platform
+#endif
+		assert(false && "T must be either a 32 or 64 bit type");
+		return value;
+	}
+#else
+	template<typename U>
+	AE_FORCEINLINE weak_atomic const& operator=(U&& x) AE_NO_TSAN
+	{
+		value.store(std::forward<U>(x), std::memory_order_relaxed);
+		return *this;
+	}
+	
+	AE_FORCEINLINE weak_atomic const& operator=(weak_atomic const& other) AE_NO_TSAN
+	{
+		value.store(other.value.load(std::memory_order_relaxed), std::memory_order_relaxed);
+		return *this;
+	}
+
+	AE_FORCEINLINE T load() const AE_NO_TSAN { return value.load(std::memory_order_relaxed); }
+	
+	AE_FORCEINLINE T fetch_add_acquire(T increment) AE_NO_TSAN
+	{
+		return value.fetch_add(increment, std::memory_order_acquire);
+	}
+	
+	AE_FORCEINLINE T fetch_add_release(T increment) AE_NO_TSAN
+	{
+		return value.fetch_add(increment, std::memory_order_release);
+	}
+#endif
+	
+
+private:
+#ifndef AE_USE_STD_ATOMIC_FOR_WEAK_ATOMIC
+	// No std::atomic support, but still need to circumvent compiler optimizations.
+	// `volatile` will make memory access slow, but is guaranteed to be reliable.
+	volatile T value;
+#else
+	std::atomic<T> value;
+#endif
+};
+
+}	// end namespace moodycamel
+
+
+
+// Portable single-producer, single-consumer semaphore below:
+
+#if defined(_WIN32)
+// Avoid including windows.h in a header; we only need a handful of
+// items, so we'll redeclare them here (this is relatively safe since
+// the API generally has to remain stable between Windows versions).
+// I know this is an ugly hack but it still beats polluting the global
+// namespace with thousands of generic names or adding a .cpp for nothing.
+extern "C" {
+	struct _SECURITY_ATTRIBUTES;
+	__declspec(dllimport) void* __stdcall CreateSemaphoreW(_SECURITY_ATTRIBUTES* lpSemaphoreAttributes, long lInitialCount, long lMaximumCount, const wchar_t* lpName);
+	__declspec(dllimport) int __stdcall CloseHandle(void* hObject);
+	__declspec(dllimport) unsigned long __stdcall WaitForSingleObject(void* hHandle, unsigned long dwMilliseconds);
+	__declspec(dllimport) int __stdcall ReleaseSemaphore(void* hSemaphore, long lReleaseCount, long* lpPreviousCount);
+}
+#elif defined(__MACH__)
+#include <mach/mach.h>
+#elif defined(__unix__)
+#include <semaphore.h>
+#elif defined(FREERTOS)
+#include <FreeRTOS.h>
+#include <semphr.h>
+#include <task.h>
+#endif
+
+namespace moodycamel
+{
+	// Code in the spsc_sema namespace below is an adaptation of Jeff Preshing's
+	// portable + lightweight semaphore implementations, originally from
+	// https://github.com/preshing/cpp11-on-multicore/blob/master/common/sema.h
+	// LICENSE:
+	// Copyright (c) 2015 Jeff Preshing
+	//
+	// This software is provided 'as-is', without any express or implied
+	// warranty. In no event will the authors be held liable for any damages
+	// arising from the use of this software.
+	//
+	// Permission is granted to anyone to use this software for any purpose,
+	// including commercial applications, and to alter it and redistribute it
+	// freely, subject to the following restrictions:
+	//
+	// 1. The origin of this software must not be misrepresented; you must not
+	//    claim that you wrote the original software. If you use this software
+	//    in a product, an acknowledgement in the product documentation would be
+	//    appreciated but is not required.
+	// 2. Altered source versions must be plainly marked as such, and must not be
+	//    misrepresented as being the original software.
+	// 3. This notice may not be removed or altered from any source distribution.
+	namespace spsc_sema
+	{
+#if defined(_WIN32)
+		class Semaphore
+		{
+		private:
+		    void* m_hSema;
+		    
+		    Semaphore(const Semaphore& other);
+		    Semaphore& operator=(const Semaphore& other);
+
+		public:
+		    AE_NO_TSAN Semaphore(int initialCount = 0) : m_hSema()
+		    {
+		        assert(initialCount >= 0);
+		        const long maxLong = 0x7fffffff;
+		        m_hSema = CreateSemaphoreW(nullptr, initialCount, maxLong, nullptr);
+		        assert(m_hSema);
+		    }
+
+		    AE_NO_TSAN ~Semaphore()
+		    {
+		        CloseHandle(m_hSema);
+		    }
+
+		    bool wait() AE_NO_TSAN
+		    {
+		    	const unsigned long infinite = 0xffffffff;
+		        return WaitForSingleObject(m_hSema, infinite) == 0;
+		    }
+
+			bool try_wait() AE_NO_TSAN
+			{
+				return WaitForSingleObject(m_hSema, 0) == 0;
+			}
+
+			bool timed_wait(std::uint64_t usecs) AE_NO_TSAN
+			{
+				return WaitForSingleObject(m_hSema, (unsigned long)(usecs / 1000)) == 0;
+			}
+
+		    void signal(int count = 1) AE_NO_TSAN
+		    {
+		        while (!ReleaseSemaphore(m_hSema, count, nullptr));
+		    }
+		};
+#elif defined(__MACH__)
+		//---------------------------------------------------------
+		// Semaphore (Apple iOS and OSX)
+		// Can't use POSIX semaphores due to http://lists.apple.com/archives/darwin-kernel/2009/Apr/msg00010.html
+		//---------------------------------------------------------
+		class Semaphore
+		{
+		private:
+		    semaphore_t m_sema;
+
+		    Semaphore(const Semaphore& other);
+		    Semaphore& operator=(const Semaphore& other);
+
+		public:
+		    AE_NO_TSAN Semaphore(int initialCount = 0) : m_sema()
+		    {
+		        assert(initialCount >= 0);
+		        kern_return_t rc = semaphore_create(mach_task_self(), &m_sema, SYNC_POLICY_FIFO, initialCount);
+		        assert(rc == KERN_SUCCESS);
+		        AE_UNUSED(rc);
+		    }
+
+		    AE_NO_TSAN ~Semaphore()
+		    {
+		        semaphore_destroy(mach_task_self(), m_sema);
+		    }
+
+		    bool wait() AE_NO_TSAN
+		    {
+		        return semaphore_wait(m_sema) == KERN_SUCCESS;
+		    }
+
+			bool try_wait() AE_NO_TSAN
+			{
+				return timed_wait(0);
+			}
+
+			bool timed_wait(std::uint64_t timeout_usecs) AE_NO_TSAN
+			{
+				mach_timespec_t ts;
+				ts.tv_sec = static_cast<unsigned int>(timeout_usecs / 1000000);
+				ts.tv_nsec = static_cast<int>((timeout_usecs % 1000000) * 1000);
+
+				// added in OSX 10.10: https://developer.apple.com/library/prerelease/mac/documentation/General/Reference/APIDiffsMacOSX10_10SeedDiff/modules/Darwin.html
+				kern_return_t rc = semaphore_timedwait(m_sema, ts);
+				return rc == KERN_SUCCESS;
+			}
+
+		    void signal() AE_NO_TSAN
+		    {
+		        while (semaphore_signal(m_sema) != KERN_SUCCESS);
+		    }
+
+		    void signal(int count) AE_NO_TSAN
+		    {
+		        while (count-- > 0)
+		        {
+		            while (semaphore_signal(m_sema) != KERN_SUCCESS);
+		        }
+		    }
+		};
+#elif defined(__unix__)
+		//---------------------------------------------------------
+		// Semaphore (POSIX, Linux)
+		//---------------------------------------------------------
+		class Semaphore
+		{
+		private:
+		    sem_t m_sema;
+
+		    Semaphore(const Semaphore& other);
+		    Semaphore& operator=(const Semaphore& other);
+
+		public:
+		    AE_NO_TSAN Semaphore(int initialCount = 0) : m_sema()
+		    {
+		        assert(initialCount >= 0);
+		        int rc = sem_init(&m_sema, 0, static_cast<unsigned int>(initialCount));
+		        assert(rc == 0);
+		        AE_UNUSED(rc);
+		    }
+
+		    AE_NO_TSAN ~Semaphore()
+		    {
+		        sem_destroy(&m_sema);
+		    }
+
+		    bool wait() AE_NO_TSAN
+		    {
+		        // http://stackoverflow.com/questions/2013181/gdb-causes-sem-wait-to-fail-with-eintr-error
+		        int rc;
+		        do
+		        {
+		            rc = sem_wait(&m_sema);
+		        }
+		        while (rc == -1 && errno == EINTR);
+		        return rc == 0;
+		    }
+
+			bool try_wait() AE_NO_TSAN
+			{
+				int rc;
+				do {
+					rc = sem_trywait(&m_sema);
+				} while (rc == -1 && errno == EINTR);
+				return rc == 0;
+			}
+
+			bool timed_wait(std::uint64_t usecs) AE_NO_TSAN
+			{
+				struct timespec ts;
+				const int usecs_in_1_sec = 1000000;
+				const int nsecs_in_1_sec = 1000000000;
+				clock_gettime(CLOCK_REALTIME, &ts);
+				ts.tv_sec += static_cast<time_t>(usecs / usecs_in_1_sec);
+				ts.tv_nsec += static_cast<long>(usecs % usecs_in_1_sec) * 1000;
+				// sem_timedwait bombs if you have more than 1e9 in tv_nsec
+				// so we have to clean things up before passing it in
+				if (ts.tv_nsec >= nsecs_in_1_sec) {
+					ts.tv_nsec -= nsecs_in_1_sec;
+					++ts.tv_sec;
+				}
+
+				int rc;
+				do {
+					rc = sem_timedwait(&m_sema, &ts);
+				} while (rc == -1 && errno == EINTR);
+				return rc == 0;
+			}
+
+		    void signal() AE_NO_TSAN
+		    {
+		        while (sem_post(&m_sema) == -1);
+		    }
+
+		    void signal(int count) AE_NO_TSAN
+		    {
+		        while (count-- > 0)
+		        {
+		            while (sem_post(&m_sema) == -1);
+		        }
+		    }
+		};
+#elif defined(FREERTOS)
+		//---------------------------------------------------------
+		// Semaphore (FreeRTOS)
+		//---------------------------------------------------------
+		class Semaphore
+		{
+		private:
+			SemaphoreHandle_t m_sema;
+
+			Semaphore(const Semaphore& other);
+			Semaphore& operator=(const Semaphore& other);
+
+		public:
+			AE_NO_TSAN Semaphore(int initialCount = 0) : m_sema()
+			{
+				assert(initialCount >= 0);
+				m_sema = xSemaphoreCreateCounting(static_cast<UBaseType_t>(~0ull), static_cast<UBaseType_t>(initialCount));
+				assert(m_sema);
+			}
+
+			AE_NO_TSAN ~Semaphore()
+			{
+				vSemaphoreDelete(m_sema);
+			}
+
+			bool wait() AE_NO_TSAN
+			{
+				return xSemaphoreTake(m_sema, portMAX_DELAY) == pdTRUE;
+			}
+
+			bool try_wait() AE_NO_TSAN
+			{
+				// Note: In an ISR context, if this causes a task to unblock,
+				// the caller won't know about it
+				if (xPortIsInsideInterrupt())
+					return xSemaphoreTakeFromISR(m_sema, NULL) == pdTRUE;
+				return xSemaphoreTake(m_sema, 0) == pdTRUE;
+			}
+
+			bool timed_wait(std::uint64_t usecs) AE_NO_TSAN
+			{
+				std::uint64_t msecs = usecs / 1000;
+				TickType_t ticks = static_cast<TickType_t>(msecs / portTICK_PERIOD_MS);
+				if (ticks == 0)
+					return try_wait();
+				return xSemaphoreTake(m_sema, ticks) == pdTRUE;
+			}
+
+			void signal() AE_NO_TSAN
+			{
+				// Note: In an ISR context, if this causes a task to unblock,
+				// the caller won't know about it
+				BaseType_t rc;
+				if (xPortIsInsideInterrupt())
+					rc = xSemaphoreGiveFromISR(m_sema, NULL);
+				else
+					rc = xSemaphoreGive(m_sema);
+				assert(rc == pdTRUE);
+				AE_UNUSED(rc);
+			}
+
+			void signal(int count) AE_NO_TSAN
+			{
+				while (count-- > 0)
+					signal();
+			}
+		};
+#else
+#error Unsupported platform! (No semaphore wrapper available)
+#endif
+
+		//---------------------------------------------------------
+		// LightweightSemaphore
+		//---------------------------------------------------------
+		class LightweightSemaphore
+		{
+		public:
+			typedef std::make_signed<std::size_t>::type ssize_t;
+			
+		private:
+		    weak_atomic<ssize_t> m_count;
+		    Semaphore m_sema;
+
+		    bool waitWithPartialSpinning(std::int64_t timeout_usecs = -1) AE_NO_TSAN
+		    {
+		        ssize_t oldCount;
+		        // Is there a better way to set the initial spin count?
+		        // If we lower it to 1000, testBenaphore becomes 15x slower on my Core i7-5930K Windows PC,
+		        // as threads start hitting the kernel semaphore.
+		        int spin = 1024;
+		        while (--spin >= 0)
+		        {
+		            if (m_count.load() > 0)
+		            {
+		                m_count.fetch_add_acquire(-1);
+		                return true;
+		            }
+		            compiler_fence(memory_order_acquire);     // Prevent the compiler from collapsing the loop.
+		        }
+		        oldCount = m_count.fetch_add_acquire(-1);
+				if (oldCount > 0)
+					return true;
+		        if (timeout_usecs < 0)
+				{
+					if (m_sema.wait())
+						return true;
+				}
+				if (timeout_usecs > 0 && m_sema.timed_wait(static_cast<uint64_t>(timeout_usecs)))
+					return true;
+				// At this point, we've timed out waiting for the semaphore, but the
+				// count is still decremented indicating we may still be waiting on
+				// it. So we have to re-adjust the count, but only if the semaphore
+				// wasn't signaled enough times for us too since then. If it was, we
+				// need to release the semaphore too.
+				while (true)
+				{
+					oldCount = m_count.fetch_add_release(1);
+					if (oldCount < 0)
+						return false;    // successfully restored things to the way they were
+					// Oh, the producer thread just signaled the semaphore after all. Try again:
+					oldCount = m_count.fetch_add_acquire(-1);
+					if (oldCount > 0 && m_sema.try_wait())
+						return true;
+				}
+		    }
+
+		public:
+		    AE_NO_TSAN LightweightSemaphore(ssize_t initialCount = 0) : m_count(initialCount), m_sema()
+		    {
+		        assert(initialCount >= 0);
+		    }
+
+		    bool tryWait() AE_NO_TSAN
+		    {
+		        if (m_count.load() > 0)
+		        {
+		        	m_count.fetch_add_acquire(-1);
+		        	return true;
+		        }
+		        return false;
+		    }
+
+		    bool wait() AE_NO_TSAN
+		    {
+		        return tryWait() || waitWithPartialSpinning();
+		    }
+
+			bool wait(std::int64_t timeout_usecs) AE_NO_TSAN
+			{
+				return tryWait() || waitWithPartialSpinning(timeout_usecs);
+			}
+
+		    void signal(ssize_t count = 1) AE_NO_TSAN
+		    {
+		    	assert(count >= 0);
+		        ssize_t oldCount = m_count.fetch_add_release(count);
+		        assert(oldCount >= -1);
+		        if (oldCount < 0)
+		        {
+		            m_sema.signal(1);
+		        }
+		    }
+		    
+		    std::size_t availableApprox() const AE_NO_TSAN
+		    {
+		    	ssize_t count = m_count.load();
+		    	return count > 0 ? static_cast<std::size_t>(count) : 0;
+		    }
+		};
+	}	// end namespace spsc_sema
+}	// end namespace moodycamel
+
+#if defined(AE_VCPP) && (_MSC_VER < 1700 || defined(__cplusplus_cli))
+#pragma warning(pop)
+#ifdef __cplusplus_cli
+#pragma managed(pop)
+#endif
+#endif
+
+
+#ifndef MOODYCAMEL_CACHE_LINE_SIZE
+#define MOODYCAMEL_CACHE_LINE_SIZE 64
+#endif
+
+namespace moodycamel {
+
+template<typename T>
+class BlockingReaderWriterCircularBuffer
+{
+public:
+	typedef T value_type;
+
+public:
+	explicit BlockingReaderWriterCircularBuffer(std::size_t capacity)
+		: maxcap(capacity), mask(), rawData(), data(),
+		slots_(new spsc_sema::LightweightSemaphore(static_cast<spsc_sema::LightweightSemaphore::ssize_t>(capacity))),
+		items(new spsc_sema::LightweightSemaphore(0)),
+		nextSlot(0), nextItem(0)
+	{
+		// Round capacity up to power of two to compute modulo mask.
+		// Adapted from http://graphics.stanford.edu/~seander/bithacks.html#RoundUpPowerOf2
+		--capacity;
+		capacity |= capacity >> 1;
+		capacity |= capacity >> 2;
+		capacity |= capacity >> 4;
+		for (std::size_t i = 1; i < sizeof(std::size_t); i <<= 1)
+			capacity |= capacity >> (i << 3);
+		mask = capacity++;
+		rawData = static_cast<char*>(std::malloc(capacity * sizeof(T) + std::alignment_of<T>::value - 1));
+		data = align_for<T>(rawData);
+	}
+
+	BlockingReaderWriterCircularBuffer(BlockingReaderWriterCircularBuffer&& other)
+		: maxcap(0), mask(0), rawData(nullptr), data(nullptr),
+		slots_(new spsc_sema::LightweightSemaphore(0)),
+		items(new spsc_sema::LightweightSemaphore(0)),
+		nextSlot(), nextItem()
+	{
+		swap(other);
+	}
+
+	BlockingReaderWriterCircularBuffer(BlockingReaderWriterCircularBuffer const&) = delete;
+
+	// Note: The queue should not be accessed concurrently while it's
+	// being deleted. It's up to the user to synchronize this.
+	~BlockingReaderWriterCircularBuffer()
+	{
+		for (std::size_t i = 0, n = items->availableApprox(); i != n; ++i)
+			reinterpret_cast<T*>(data)[(nextItem + i) & mask].~T();
+		std::free(rawData);
+	}
+
+	BlockingReaderWriterCircularBuffer& operator=(BlockingReaderWriterCircularBuffer&& other) noexcept
+	{
+		swap(other);
+		return *this;
+	}
+
+	BlockingReaderWriterCircularBuffer& operator=(BlockingReaderWriterCircularBuffer const&) = delete;
+
+	// Swaps the contents of this buffer with the contents of another.
+	// Not thread-safe.
+	void swap(BlockingReaderWriterCircularBuffer& other) noexcept
+	{
+		std::swap(maxcap, other.maxcap);
+		std::swap(mask, other.mask);
+		std::swap(rawData, other.rawData);
+		std::swap(data, other.data);
+		std::swap(slots_, other.slots_);
+		std::swap(items, other.items);
+		std::swap(nextSlot, other.nextSlot);
+		std::swap(nextItem, other.nextItem);
+	}
+
+	// Enqueues a single item (by copying it).
+	// Fails if not enough room to enqueue.
+	// Thread-safe when called by producer thread.
+	// No exception guarantee (state will be corrupted) if constructor of T throws.
+	bool try_enqueue(T const& item)
+	{
+		if (!slots_->tryWait())
+			return false;
+		inner_enqueue(item);
+		return true;
+	}
+
+	// Enqueues a single item (by moving it, if possible).
+	// Fails if not enough room to enqueue.
+	// Thread-safe when called by producer thread.
+	// No exception guarantee (state will be corrupted) if constructor of T throws.
+	bool try_enqueue(T&& item)
+	{
+		if (!slots_->tryWait())
+			return false;
+		inner_enqueue(std::move(item));
+		return true;
+	}
+
+	// Blocks the current thread until there's enough space to enqueue the given item,
+	// then enqueues it (via copy).
+	// Thread-safe when called by producer thread.
+	// No exception guarantee (state will be corrupted) if constructor of T throws.
+	void wait_enqueue(T const& item)
+	{
+		while (!slots_->wait());
+		inner_enqueue(item);
+	}
+
+	// Blocks the current thread until there's enough space to enqueue the given item,
+	// then enqueues it (via move, if possible).
+	// Thread-safe when called by producer thread.
+	// No exception guarantee (state will be corrupted) if constructor of T throws.
+	void wait_enqueue(T&& item)
+	{
+		while (!slots_->wait());
+		inner_enqueue(std::move(item));
+	}
+
+	// Blocks the current thread until there's enough space to enqueue the given item,
+	// or the timeout expires. Returns false without enqueueing the item if the timeout
+	// expires, otherwise enqueues the item (via copy) and returns true.
+	// Thread-safe when called by producer thread.
+	// No exception guarantee (state will be corrupted) if constructor of T throws.
+	bool wait_enqueue_timed(T const& item, std::int64_t timeout_usecs)
+	{
+		if (!slots_->wait(timeout_usecs))
+			return false;
+		inner_enqueue(item);
+		return true;
+	}
+
+	// Blocks the current thread until there's enough space to enqueue the given item,
+	// or the timeout expires. Returns false without enqueueing the item if the timeout
+	// expires, otherwise enqueues the item (via move, if possible) and returns true.
+	// Thread-safe when called by producer thread.
+	// No exception guarantee (state will be corrupted) if constructor of T throws.
+	bool wait_enqueue_timed(T&& item, std::int64_t timeout_usecs)
+	{
+		if (!slots_->wait(timeout_usecs))
+			return false;
+		inner_enqueue(std::move(item));
+		return true;
+	}
+
+	// Blocks the current thread until there's enough space to enqueue the given item,
+	// or the timeout expires. Returns false without enqueueing the item if the timeout
+	// expires, otherwise enqueues the item (via copy) and returns true.
+	// Thread-safe when called by producer thread.
+	// No exception guarantee (state will be corrupted) if constructor of T throws.
+	template<typename Rep, typename Period>
+	inline bool wait_enqueue_timed(T const& item, std::chrono::duration<Rep, Period> const& timeout)
+	{
+		return wait_enqueue_timed(item, std::chrono::duration_cast<std::chrono::microseconds>(timeout).count());
+	}
+
+	// Blocks the current thread until there's enough space to enqueue the given item,
+	// or the timeout expires. Returns false without enqueueing the item if the timeout
+	// expires, otherwise enqueues the item (via move, if possible) and returns true.
+	// Thread-safe when called by producer thread.
+	// No exception guarantee (state will be corrupted) if constructor of T throws.
+	template<typename Rep, typename Period>
+	inline bool wait_enqueue_timed(T&& item, std::chrono::duration<Rep, Period> const& timeout)
+	{
+		return wait_enqueue_timed(std::move(item), std::chrono::duration_cast<std::chrono::microseconds>(timeout).count());
+	}
+
+	// Attempts to dequeue a single item.
+	// Returns false if the buffer is empty.
+	// Thread-safe when called by consumer thread.
+	// No exception guarantee (state will be corrupted) if assignment operator of U throws.
+	template<typename U>
+	bool try_dequeue(U& item)
+	{
+		if (!items->tryWait())
+			return false;
+		inner_dequeue(item);
+		return true;
+	}
+
+	// Blocks the current thread until there's something to dequeue, then dequeues it.
+	// Thread-safe when called by consumer thread.
+	// No exception guarantee (state will be corrupted) if assignment operator of U throws.
+	template<typename U>
+	void wait_dequeue(U& item)
+	{
+		while (!items->wait());
+		inner_dequeue(item);
+	}
+
+	// Blocks the current thread until either there's something to dequeue
+	// or the timeout expires. Returns false without setting `item` if the
+	// timeout expires, otherwise assigns to `item` and returns true.
+	// Thread-safe when called by consumer thread.
+	// No exception guarantee (state will be corrupted) if assignment operator of U throws.
+	template<typename U>
+	bool wait_dequeue_timed(U& item, std::int64_t timeout_usecs)
+	{
+		if (!items->wait(timeout_usecs))
+			return false;
+		inner_dequeue(item);
+		return true;
+	}
+
+	// Blocks the current thread until either there's something to dequeue
+	// or the timeout expires. Returns false without setting `item` if the
+	// timeout expires, otherwise assigns to `item` and returns true.
+	// Thread-safe when called by consumer thread.
+	// No exception guarantee (state will be corrupted) if assignment operator of U throws.
+	template<typename U, typename Rep, typename Period>
+	inline bool wait_dequeue_timed(U& item, std::chrono::duration<Rep, Period> const& timeout)
+	{
+		return wait_dequeue_timed(item, std::chrono::duration_cast<std::chrono::microseconds>(timeout).count());
+	}
+
+	// Returns a (possibly outdated) snapshot of the total number of elements currently in the buffer.
+	// Thread-safe.
+	inline std::size_t size_approx() const
+	{
+		return items->availableApprox();
+	}
+
+	// Returns the maximum number of elements that this circular buffer can hold at once.
+	// Thread-safe.
+	inline std::size_t max_capacity() const
+	{
+		return maxcap;
+	}
+
+private:
+	template<typename U>
+	void inner_enqueue(U&& item)
+	{
+		std::size_t i = nextSlot++;
+		new (reinterpret_cast<T*>(data) + (i & mask)) T(std::forward<U>(item));
+		items->signal();
+	}
+
+	template<typename U>
+	void inner_dequeue(U& item)
+	{
+		std::size_t i = nextItem++;
+		T& element = reinterpret_cast<T*>(data)[i & mask];
+		item = std::move(element);
+		element.~T();
+		slots_->signal();
+	}
+
+	template<typename U>
+	static inline char* align_for(char* ptr)
+	{
+		const std::size_t alignment = std::alignment_of<U>::value;
+		return ptr + (alignment - (reinterpret_cast<std::uintptr_t>(ptr) % alignment)) % alignment;
+	}
+
+private:
+	std::size_t maxcap;                           // actual (non-power-of-two) capacity
+	std::size_t mask;                             // circular buffer capacity mask (for cheap modulo)
+	char* rawData;                                // raw circular buffer memory
+	char* data;                                   // circular buffer memory aligned to element alignment
+	std::unique_ptr<spsc_sema::LightweightSemaphore> slots_;  // number of slots currently free (named with underscore to accommodate Qt's 'slots' macro)
+	std::unique_ptr<spsc_sema::LightweightSemaphore> items;   // number of elements currently enqueued
+	char cachelineFiller0[MOODYCAMEL_CACHE_LINE_SIZE - sizeof(char*) * 2 - sizeof(std::size_t) * 2 - sizeof(std::unique_ptr<spsc_sema::LightweightSemaphore>) * 2];
+	std::size_t nextSlot;                         // index of next free slot to enqueue into
+	char cachelineFiller1[MOODYCAMEL_CACHE_LINE_SIZE - sizeof(std::size_t)];
+	std::size_t nextItem;                         // index of next element to dequeue from
+};
+
+}
+
 /** @file
  *  @brief Contains the main CSV parsing algorithm and various utility functions
  */
 
 #include <algorithm>
 #include <array>
-#include <condition_variable>
-#include <deque>
+#include <atomic>
 #include <fstream>
+#include <future>
 #include <memory>
-#include <mutex>
-#include <unordered_map>
-#include <unordered_set>
 #include <thread>
 #include <vector>
 
@@ -5407,11 +6449,12 @@ namespace csv {
     namespace internals {
         class IBasicCSVParser;
 
-        static const std::string ERROR_NAN = "Not a number.";
-        static const std::string ERROR_OVERFLOW = "Overflow error.";
-        static const std::string ERROR_FLOAT_TO_INT =
-            "Attempted to convert a floating point value to an integral type.";
-        static const std::string ERROR_NEG_TO_UNSIGNED = "Negative numbers cannot be converted to unsigned types.";
+        const std::string ERROR_NAN { "Not a number." };
+        const std::string ERROR_OVERFLOW { "Overflow error." };
+        const std::string ERROR_FLOAT_TO_INT {
+            "Attempted to convert a floating point value to an integral type." };
+
+        const std::string ERROR_NEG_TO_UNSIGNED{ "Negative numbers cannot be converted to unsigned types." };
     
         std::string json_escape_string(csv::string_view s) noexcept;
 
@@ -5437,7 +6480,7 @@ namespace csv {
         /** A class used for efficiently storing RawCSVField objects and expanding as necessary
          *
          *  @par Implementation
-         *  This data structure stores RawCSVField in continguous blocks. When more capacity
+         *  This data structure stores RawCSVField in contiguous blocks. When more capacity
          *  is needed, a new block is allocated, but previous data stays put.
          *
          *  @par Thread Safety
@@ -5488,7 +6531,7 @@ namespace csv {
         private:
             const size_t _single_buffer_capacity;
 
-            std::vector<RawCSVField*> buffers = {};
+            std::vector<RawCSVField*> buffers;
 
             /** Number of items in the current buffer */
             size_t _current_buffer_size = 0;
@@ -5508,12 +6551,7 @@ namespace csv {
             std::shared_ptr<std::string> _dataString;
             csv::string_view data = "";
 
-            internals::CSVFieldList fields;
-
             std::unordered_set<size_t> has_double_quotes;
-
-            // TODO: Consider replacing with a more thread-safe structure
-            std::unordered_map<size_t, std::string> double_quote_fields = {};
 
             internals::ColNamesPtr col_names = nullptr;
             internals::ParseFlagMap parse_flags;
@@ -5735,6 +6773,11 @@ namespace csv {
         /** Return the number of fields in this row */
         CONSTEXPR size_t size() const noexcept { return row_length; }
 
+        /** Sent when the sender thread exits to wake up the receiver.
+         *  All rows may or may not have been sent.
+         */
+        bool tombstone() const { return this->data.get() == nullptr; }
+
         /** @name Value Retrieval */
         ///@{
         CSVField operator[](size_t n) const;
@@ -5822,6 +6865,10 @@ namespace csv {
 
         internals::RawCSVDataPtr data;
 
+        std::vector<csv::internals::RawCSVField> fields;
+
+        mutable std::unordered_map<size_t, std::string> double_quote_fields;
+
         /** Where in RawCSVData.data we start */
         size_t data_start = 0;
 
@@ -5885,7 +6932,79 @@ inline std::ostream& operator << (std::ostream& os, csv::CSVField const& value) 
 
 
 namespace csv {
+
+    using ChannelBuffer = moodycamel::BlockingReaderWriterCircularBuffer<CSVRow>;
+
+    // 
+    /** Read rows produced by IBasicCSVParser. 
+     *
+     *  Intended to be called from the primary thread.
+     */
+    class CSVQueueReader {
+    public:
+
+        CSVQueueReader(ChannelBuffer& channel, std::future<bool>&& bomResult)
+            : _channel(channel), _bomResult(std::move(bomResult)) {}
+
+        /** @name Retrieving CSV Rows */
+        ///@{
+
+        bool read_row(CSVRow& row);
+
+        /** Read all rows and write to an inserter.
+         */
+        template <class T>
+        void read_collection(T inserter)
+        {
+            CSVRow row;
+            while (this->read_row(row))
+            {
+                *inserter++ = std::move(row);
+            }
+        }
+
+        /** True if all rows have been read.
+         */
+        bool eof() { return this->_received_tombstone; }
+
+        /** @name CSV Metadata: Attributes */
+        ///@{
+
+        /** Retrieves the number of rows that have been read so far */
+        CONSTEXPR size_t n_rows() const noexcept { return this->_n_rows; }
+
+        /** Whether or not CSV was prefixed with a UTF-8 bom */
+        bool utf8_bom() const {
+            return this->_bomResult.get();
+        }
+        ///@}
+
+        /** Low level access to read queue. You may not call any reader functions if you call any functions
+            that change the queue. Make sure you handle tombstones! */
+        ChannelBuffer& channel() { return _channel; }
+
+        void set_current_exception() {
+            this->teptr = std::current_exception();
+        }
+
+        bool _utf8_bom = false;
+
+    protected:
+
+        ChannelBuffer& _channel;
+
+        mutable std::future<bool> _bomResult;
+
+        size_t _n_rows = 0; /**< How many rows (minus header) have been read so far */
+
+        std::exception_ptr teptr = nullptr;
+
+        bool _received_tombstone = false;
+    };
+
     namespace internals {
+        std::string format_row(const std::vector<std::string>& row, csv::string_view delim = ", ");
+
         /** Create a vector v where each index i corresponds to the
          *  ASCII number for a character and, v[i + 128] labels it according to
          *  the CSVReader::ParseFlags enum
@@ -5949,107 +7068,15 @@ namespace csv {
         /** Read the first 500KB of a CSV file */
         CSV_INLINE std::string get_csv_head(csv::string_view filename, size_t file_size);
 
-        /** A std::deque wrapper which allows multiple read and write threads to concurrently
-         *  access it along with providing read threads the ability to wait for the deque
-         *  to become populated
-         */
-        template<typename T>
-        class ThreadSafeDeque {
-        public:
-            ThreadSafeDeque(size_t notify_size = 100) : _notify_size(notify_size) {};
-            ThreadSafeDeque(const ThreadSafeDeque& other) {
-                this->data = other.data;
-                this->_notify_size = other._notify_size;
-            }
-
-            ThreadSafeDeque(const std::deque<T>& source) : ThreadSafeDeque() {
-                this->data = source;
-            }
-
-            void clear() noexcept { this->data.clear(); }
-
-            bool empty() const noexcept {
-                return this->data.empty();
-            }
-
-            T& front() noexcept {
-                return this->data.front();
-            }
-
-            T& operator[](size_t n) {
-                return this->data[n];
-            }
-
-            void push_back(T&& item) {
-                std::lock_guard<std::mutex> lock{ this->_lock };
-                this->data.push_back(std::move(item));
-
-                if (this->size() >= _notify_size) {
-                    this->_cond.notify_all();
-                }
-            }
-
-            T pop_front() noexcept {
-                std::lock_guard<std::mutex> lock{ this->_lock };
-                T item = std::move(data.front());
-                data.pop_front();
-                return item;
-            }
-
-            size_t size() const noexcept { return this->data.size(); }
-
-            /** Returns true if a thread is actively pushing items to this deque */
-            constexpr bool is_waitable() const noexcept { return this->_is_waitable; }
-
-            /** Wait for an item to become available */
-            void wait() {
-                if (!is_waitable()) {
-                    return;
-                }
-
-                std::unique_lock<std::mutex> lock{ this->_lock };
-                this->_cond.wait(lock, [this] { return this->size() >= _notify_size || !this->is_waitable(); });
-                lock.unlock();
-            }
-
-            typename std::deque<T>::iterator begin() noexcept {
-                return this->data.begin();
-            }
-
-            typename std::deque<T>::iterator end() noexcept {
-                return this->data.end();
-            }
-
-            /** Tell listeners that this deque is actively being pushed to */
-            void notify_all() {
-                std::unique_lock<std::mutex> lock{ this->_lock };
-                this->_is_waitable = true;
-                this->_cond.notify_all();
-            }
-
-            /** Tell all listeners to stop */
-            void kill_all() {
-                std::unique_lock<std::mutex> lock{ this->_lock };
-                this->_is_waitable = false;
-                this->_cond.notify_all();
-            }
-
-        private:
-            bool _is_waitable = false;
-            size_t _notify_size;
-            std::mutex _lock;
-            std::condition_variable _cond;
-            std::deque<T> data;
-        };
-
         constexpr const int UNINITIALIZED_FIELD = -1;
     }
 
-    /** Standard type for storing collection of rows */
-    using RowCollection = internals::ThreadSafeDeque<CSVRow>;
-
     namespace internals {
         /** Abstract base class which provides CSV parsing logic.
+         * 
+         *  Safe to access from the primary thread:
+         *    - reader
+         *    - stop_thread_and_join()
          *
          *  Concrete implementations may customize this logic across
          *  different input sources, such as memory mapped files, stringstreams,
@@ -6062,16 +7089,42 @@ namespace csv {
             IBasicCSVParser(const ParseFlagMap& parse_flags, const WhitespaceMap& ws_flags
             ) : _parse_flags(parse_flags), _ws_flags(ws_flags) {};
 
-            virtual ~IBasicCSVParser() {}
+            virtual ~IBasicCSVParser() = default;
 
-            /** Whether or not we have reached the end of source */
-            bool eof() { return this->_eof; }
+            /** Main loop to read the CSV file. Okay to call this directly
+                for a string or stream-based csv file, but do not call this
+                directly for very large memory-mapped (file-based) CSV files
+                or the whole file will be memory-mapped, which can fail.
+             */
+            bool read_csv(size_t bytes = static_cast<size_t>(~0));
 
+            void stop_thread_and_join(std::thread& read_csv_worker);
+
+            void set_max_rows(size_t max_rows = -1) {
+                _max_rows = max_rows;
+            }
+
+            void set_iteration_chunk_size(size_t chunk_size) {
+                this->_iteration_chunk_size = chunk_size;
+            }
+
+            std::promise<bool> _bomPromise;
+
+            ChannelBuffer _channel = ChannelBuffer(1000);
+
+            CSVQueueReader queue_reader = CSVQueueReader(_channel, std::move(_bomPromise.get_future()));
+
+            std::atomic_bool _terminateNow;
+
+        protected:
             /** Parse the next block of data */
-            virtual void next(size_t bytes) = 0;
+            virtual void next() = 0;
 
             /** Indicate the last block of data has been parsed */
             void end_feed();
+
+            /** Used by worker thread to put a tombstone on the queue */
+            void enqueue_tombstone();
 
             CONSTEXPR_17 ParseFlags parse_flag(const char ch) const noexcept {
                 return _parse_flags.data()[ch + 128];
@@ -6081,20 +7134,37 @@ namespace csv {
                 return quote_escape_flag(parse_flag(ch), this->quote_escape);
             }
 
-            /** Whether or not this CSV has a UTF-8 byte order mark */
-            CONSTEXPR bool utf8_bom() const { return this->_utf8_bom; }
+            /** Whether or not we have reached the end of source. This must not be used
+                from the primary thread because it is updated asynchronously.
+             */
+            bool eof() { return this->_eof; }
 
-            void set_output(RowCollection& rows) { this->_records = &rows; }
+            /** Whether or not source needs to be read in chunks */
+            CONSTEXPR bool no_chunk() const { return this->source_size < this->_iteration_chunk_size; }
+
+            /** Parse the current chunk of data *
+             *
+             *  @returns How many character were read that are part of complete rows
+             */
+            size_t parse(bool forceNewline);
+
+            /** Create a new RawCSVDataPtr for a new chunk of data */
+            void reset_data_ptr();
+
+            /** Handle possible Unicode byte order mark */
+            void trim_utf8_bom();
 
         protected:
             /** @name Current Parser State */
             ///@{
             CSVRow current_row;
-            RawCSVDataPtr data_ptr = nullptr;
-            ColNamesPtr _col_names = nullptr;
-            CSVFieldList* fields = nullptr;
+            // TODO - not thread safe!
+            RawCSVDataPtr data_ptr;
+            ColNamesPtr _col_names;
+            //CSVFieldList* fields = nullptr;
             int field_start = UNINITIALIZED_FIELD;
             size_t field_length = 0;
+            size_t _max_rows = (size_t)~0;    // Read no more than this many lines
 
             /** An array where the (i + 128)th slot gives the ParseFlags for ASCII character i */
             ParseFlagMap _parse_flags;
@@ -6106,19 +7176,10 @@ namespace csv {
 
             /** The size of the incoming CSV */
             size_t source_size = 0;
+
+            size_t _iteration_chunk_size = ITERATION_CHUNK_SIZE;
             ///@}
 
-            /** Whether or not source needs to be read in chunks */
-            CONSTEXPR bool no_chunk(size_t bytes) const { return this->source_size < bytes; }
-
-            /** Parse the current chunk of data *
-             *
-             *  @returns How many character were read that are part of complete rows
-             */
-            size_t parse(bool forceNewline);
-
-            /** Create a new RawCSVDataPtr for a new chunk of data */
-            void reset_data_ptr();
         private:
             /** An array where the (i + 128)th slot determines whether ASCII character i should
              *  be trimmed
@@ -6132,10 +7193,6 @@ namespace csv {
 
             /** Whether or not an attempt to find Unicode BOM has been made */
             bool unicode_bom_scan = false;
-            bool _utf8_bom = false;
-
-            /** Where complete rows should be pushed to */
-            RowCollection* _records = nullptr;
 
             CONSTEXPR_17 bool ws_flag(const char ch) const noexcept {
                 return _ws_flags.data()[ch + 128];
@@ -6155,9 +7212,6 @@ namespace csv {
 
             /** Finish parsing the current row */
             void push_row();
-
-            /** Handle possible Unicode byte order mark */
-            void trim_utf8_bom();
         };
 
         /** A class for parsing CSV data from a `std::stringstream`
@@ -6165,8 +7219,6 @@ namespace csv {
          */
         template<typename TStream>
         class StreamParser: public IBasicCSVParser {
-            using RowCollection = ThreadSafeDeque<CSVRow>;
-
         public:
             StreamParser(TStream& source,
                 const CSVFormat& format,
@@ -6181,9 +7233,10 @@ namespace csv {
                 _source(std::move(source))
             {};
 
-            ~StreamParser() {}
+            ~StreamParser() = default;
 
-            void next(size_t bytes = ITERATION_CHUNK_SIZE) override {
+        protected:
+            void next() override {
                 if (this->eof()) return;
 
                 this->reset_data_ptr();
@@ -6198,19 +7251,16 @@ namespace csv {
                 }
 
                 // Read data into buffer
-                size_t length = std::min(source_size - stream_pos, bytes);
+                size_t length = std::min(source_size - stream_pos, this->_iteration_chunk_size);
                 stream_pos = this->data_ptr->CreateStringSource(_source, stream_pos, length);
+                const bool forceNewline = (stream_pos + this->_iteration_chunk_size >= source_size);
 
                 // Parse
                 this->current_row = CSVRow(this->data_ptr);
-                bool forceNewline = (stream_pos + bytes >= source_size);
                 size_t completed = this->parse(forceNewline);
                 this->stream_pos -= (length - completed);
 
-                // TODO - no_chunk uses a hardcoded ITERATION_CHUNK_SIZE, which
-                // isn't always accurate. One example is for get_csv_head().
-                // no_chunk() is required for get_csv_head() to succeed.
-                if (stream_pos == source_size || no_chunk(bytes)) {
+                if (eof() || stream_pos == source_size || no_chunk()) {
                     this->_eof = true;
                     this->end_feed();
                 }
@@ -6225,23 +7275,22 @@ namespace csv {
          *  or an `std::ifstream`
          */
         class StringViewParser : public IBasicCSVParser {
-            using RowCollection = ThreadSafeDeque<CSVRow>;
-
         public:
             StringViewParser(std::string_view source,
                 const CSVFormat& format,
                 const ColNamesPtr& col_names = nullptr
             ) : IBasicCSVParser(format, col_names), _source(std::move(source)) {};
 
-            StringViewParser(
-                std::string_view& source,
-                internals::ParseFlagMap parse_flags,
-                internals::WhitespaceMap ws_flags) :
-                IBasicCSVParser(parse_flags, ws_flags),
-                _source(std::move(source))
-            {};
+            //StringViewParser(
+            //    std::string_view& source,
+            //    internals::ParseFlagMap parse_flags,
+            //    internals::WhitespaceMap ws_flags) :
+            //    IBasicCSVParser(parse_flags, ws_flags),
+            //    _source(std::move(source))
+            //{};
 
-            CSV_INLINE void next(size_t bytes = ITERATION_CHUNK_SIZE) override;
+        protected:
+            CSV_INLINE void next() override;
 
         private:
             std::string_view _source;
@@ -6267,9 +7316,10 @@ namespace csv {
                 this->source_size = get_file_size(filename);
             };
 
-            ~MmapParser() {}
+            ~MmapParser() = default;
 
-            void next(size_t bytes) override;
+        protected:
+            void next() override;
 
         private:
             std::string _filename;
@@ -6283,8 +7333,6 @@ namespace csv {
 namespace csv {
     /** Stuff that is generally not of interest to end-users */
     namespace internals {
-        std::string format_row(const std::vector<std::string>& row, csv::string_view delim = ", ");
-
         std::vector<std::string> _get_col_names( csv::string_view head, const CSVFormat format = CSVFormat::guess_csv());
 
         struct GuessScore {
@@ -6345,7 +7393,7 @@ namespace csv {
             CONSTEXPR_14 pointer operator->() { return &(this->row); }
 
             iterator& operator++();   /**< Pre-increment iterator */
-            iterator operator++(int); /**< Post-increment ierator */
+            iterator operator++(int); /**< Post-increment iterator */
             iterator& operator--();
 
             /** Returns true if iterators were constructed from the same CSVReader
@@ -6384,7 +7432,8 @@ namespace csv {
 
             this->parser = std::unique_ptr<Parser>(
                 new Parser(source, format, col_names)); // For C++11
-            this->initial_read();
+
+            launch_worker_thread();
         }
         ///@}
 
@@ -6393,19 +7442,31 @@ namespace csv {
         CSVReader& operator=(const CSVReader&) = delete; // No copy assignment
         CSVReader& operator=(CSVReader&& other) = default;
         ~CSVReader() {
-            if (this->read_csv_worker.joinable()) {
-                this->read_csv_worker.join();
-            }
+            stop_thread_and_join();
         }
 
         /** @name Retrieving CSV Rows */
         ///@{
-        bool read_row(CSVRow &row);
+        bool read_row(CSVRow& row);
+
         iterator begin();
         HEDLEY_CONST iterator end() const noexcept;
 
-        /** Returns true if we have reached end of file */
-        bool eof() const noexcept { return this->parser->eof(); };
+        /** Returns true if all rows have been returned. This can happen early if set_max_rows() was used.*/
+        bool eof() const noexcept { return this->parser->queue_reader.eof(); };
+
+        /** Read all rows and write to an inserter.
+         */
+        template <class T>
+        void read_collection(T inserter)
+        {
+            CSVRow row;
+            while (this->read_row(row))
+            {
+                *inserter++ = std::move(row);
+            }
+        }
+
         ///@}
 
         /** @name CSV Metadata */
@@ -6417,19 +7478,12 @@ namespace csv {
 
         /** @name CSV Metadata: Attributes */
         ///@{
-        /** Whether or not the file or stream contains valid CSV rows,
-         *  not including the header.
-         *
-         *  @note Gives an accurate answer regardless of when it is called.
-         *
-         */
-        CONSTEXPR bool empty() const noexcept { return this->n_rows() == 0; }
 
         /** Retrieves the number of rows that have been read so far */
-        CONSTEXPR size_t n_rows() const noexcept { return this->_n_rows; }
+        CONSTEXPR size_t n_rows() const noexcept { return this->_n_data_rows; }
 
         /** Whether or not CSV was prefixed with a UTF-8 bom */
-        bool utf8_bom() const noexcept { return this->parser->utf8_bom(); }
+        bool utf8_bom() const noexcept { return this->parser->queue_reader.utf8_bom(); }
         ///@}
 
     protected:
@@ -6454,18 +7508,23 @@ namespace csv {
         internals::ColNamesPtr col_names = std::make_shared<internals::ColNames>();
 
         /** Helper class which actually does the parsing */
-        std::unique_ptr<internals::IBasicCSVParser> parser = nullptr;
-
-        /** Queue of parsed CSV rows */
-        std::unique_ptr<RowCollection> records{new RowCollection(100)};
+        std::unique_ptr<internals::IBasicCSVParser> parser;
 
         size_t n_cols = 0;  /**< The number of columns in this CSV */
-        size_t _n_rows = 0; /**< How many rows (minus header) have been read so far */
+        size_t _n_data_rows = 0;  /**< The number of data rows read from this CSV */
 
         /** @name Multi-Threaded File Reading Functions */
         ///@{
         bool read_csv(size_t bytes = internals::ITERATION_CHUNK_SIZE);
         ///@}
+
+        bool trim_header();
+
+        // Will throw an exception if there's an issue with the file, such as it doesn't exist.
+        void launch_worker_thread();
+
+        /** Tell the worker thread to stop and wait until we join */
+        void stop_thread_and_join();
 
         /**@}*/
 
@@ -6477,14 +7536,6 @@ namespace csv {
         ///@{
         std::thread read_csv_worker; /**< Worker thread for read_csv() */
         ///@}
-
-        /** Read initial chunk to get metadata */
-        void initial_read() {
-            // Read directly so that we don't have to wait for a thread to start.
-            read_csv(1 << 20);
-        }
-
-        void trim_header();
     };
 }
 
@@ -6957,7 +8008,53 @@ namespace csv {
 
 
 namespace csv {
+
+    /**
+     * Retrieve rows as CSVRow objects. Returns false if no more rows are available.
+     *
+     * @param[out] row The variable where the parsed row will be stored
+     * @see CSVRow, CSVField
+     *
+     * **Example:**
+     * \snippet tests/test_read_csv.cpp CSVField Example
+     *
+     */
+    CSV_INLINE bool CSVQueueReader::read_row(CSVRow& row) {
+
+        if (_received_tombstone) {
+            return false;
+        }
+
+        channel().wait_dequeue(row);
+        if (this->teptr)
+        {
+            std::rethrow_exception(teptr);
+        }
+        if (row.tombstone())
+        {
+            _received_tombstone = true;
+            return false;
+        }
+
+        ++_n_rows;
+
+        return true;
+    }
+
     namespace internals {
+        CSV_INLINE std::string format_row(const std::vector<std::string>& row, csv::string_view delim) {
+            /** Print a CSV row */
+            std::stringstream ret;
+            for (size_t i = 0; i < row.size(); i++) {
+                ret << row[i];
+                if (i + 1 < row.size()) ret << delim;
+                else ret << '\n';
+            }
+            ret.flush();
+
+            return ret.str();
+        }
+
         CSV_INLINE size_t get_file_size(csv::string_view filename) {
             std::ifstream infile(std::string(filename), std::ios::binary);
             if (!infile) {
@@ -7000,6 +8097,7 @@ namespace csv {
             const CSVFormat& format,
             const ColNamesPtr& col_names
         ) : _col_names(col_names) {
+
             if (format.no_quote) {
                 _parse_flags = internals::make_parse_flags(format.get_delim());
             }
@@ -7010,6 +8108,56 @@ namespace csv {
             _ws_flags = internals::make_ws_flags(
                 format.trim_chars.data(), format.trim_chars.size()
             );
+        }
+
+        /**
+         * Read all of the CSV data, unless interrupted.
+         *
+         * @note This method usually runs on its own thread.
+         *
+         * @param[in] bytes Number of bytes to read.
+         *
+         * @see CSVReader::read_row()
+         */
+        CSV_INLINE bool IBasicCSVParser::read_csv(size_t bytes) {
+            set_iteration_chunk_size(bytes);
+            bool result = true;
+            try
+            {
+                while (!eof() && !_terminateNow)
+                {
+                    this->next();
+                }
+            }
+            catch (...)
+            {
+                this->queue_reader.set_current_exception();
+                result = false;
+            }
+
+            this->enqueue_tombstone();
+
+            return result;
+        }
+
+        CSV_INLINE void IBasicCSVParser::stop_thread_and_join(std::thread& read_csv_worker)
+        {
+            this->_terminateNow = true;
+
+            CSVRow row;
+            while (!this->queue_reader.eof() && !row.tombstone() && read_csv_worker.joinable())
+            {
+                // There could be many rows pending in the queue.
+                this->_channel.wait_dequeue_timed(row, 10000);
+            }
+
+            if (read_csv_worker.joinable()) {
+                // If the circular buffer is full, make space for the other thread to loop.
+                this->_channel.try_dequeue(row);
+                this->_channel.try_dequeue(row);
+
+                read_csv_worker.join();
+            }
         }
 
         CSV_INLINE void IBasicCSVParser::end_feed() {
@@ -7028,6 +8176,13 @@ namespace csv {
             // Push row
             if (this->current_row.size() > 0)
                 this->push_row();
+        }
+
+        CSV_INLINE void IBasicCSVParser::enqueue_tombstone()
+        {
+            this->current_row = CSVRow(nullptr);
+            //this->current_row = CSVRow({}, this->data_pos, this->current_row.fields.size());
+            _channel.wait_enqueue(std::move(current_row));
         }
 
         CSV_INLINE void IBasicCSVParser::parse_field() noexcept {
@@ -7059,16 +8214,15 @@ namespace csv {
         {
             // Update
             if (field_has_double_quote) {
-                fields->emplace_back(
+                current_row.fields.emplace_back(
                     field_start == UNINITIALIZED_FIELD ? 0 : (unsigned int)field_start,
                     field_length,
                     true
                 );
                 field_has_double_quote = false;
-
             }
             else {
-                fields->emplace_back(
+                current_row.fields.emplace_back(
                     field_start == UNINITIALIZED_FIELD ? 0 : (unsigned int)field_start,
                     field_length
                 );
@@ -7085,10 +8239,12 @@ namespace csv {
         {
             // End of record -> Write record
             this->push_field();
+            auto size = this->_col_names ? this->_col_names->size() : this->current_row.fields.size();
             this->push_row();
 
             // Reset
-            this->current_row = CSVRow(data_ptr, this->data_pos, fields->size());
+            this->current_row = CSVRow(data_ptr, this->data_pos, current_row.fields.size());
+            this->current_row.fields.reserve(size);
         }
 
         /** @return The number of characters parsed that belong to complete rows */
@@ -7099,6 +8255,7 @@ namespace csv {
             this->quote_escape = false;
             this->data_pos = 0;
             this->current_row_start() = 0;
+
             this->trim_utf8_bom();
 
             auto& in = this->data_ptr->data;
@@ -7110,6 +8267,12 @@ namespace csv {
                     break;
 
                 case ParseFlags::NEWLINE:
+                    if (this->_terminateNow)
+                    {
+                        this->_eof = true;
+                        return 0;
+                    }
+
                     this->data_pos++;
                     // Skip past a two-character CRLF (or LFLF)
                     // There's a corner case if the CRLF/LFLF is split across two chunks.
@@ -7119,6 +8282,11 @@ namespace csv {
                         this->data_pos++;
 
                     processNewline();
+                    if (_max_rows == 0)
+                    {
+                        this->_eof = true;
+                        return 0;
+                    }
                     break;
 
                 case ParseFlags::NOT_SPECIAL:
@@ -7174,15 +8342,18 @@ namespace csv {
         }
 
         CSV_INLINE void IBasicCSVParser::push_row() {
-            current_row.row_length = fields->size() - current_row.fields_start;
-            this->_records->push_back(std::move(current_row));
+            current_row.row_length = current_row.fields.size() - current_row.fields_start;
+            _channel.wait_enqueue(std::move(current_row));
+            if (_max_rows > 0) {
+                --_max_rows;
+            }
         }
 
         CSV_INLINE void IBasicCSVParser::reset_data_ptr() {
             this->data_ptr = std::make_shared<RawCSVData>();
             this->data_ptr->parse_flags = this->_parse_flags;
             this->data_ptr->col_names = this->_col_names;
-            this->fields = &(this->data_ptr->fields);
+            //this->current_row.fields = &(this->data_ptr->fields);
         }
 
         CSV_INLINE void IBasicCSVParser::trim_utf8_bom() {
@@ -7191,12 +8362,16 @@ namespace csv {
             if (!this->unicode_bom_scan && data.size() >= 3) {
                 if (data[0] == '\xEF' && data[1] == '\xBB' && data[2] == '\xBF') {
                     this->data_pos += 3; // Remove BOM from input string
-                    this->_utf8_bom = true;
+                    this->_bomPromise.set_value(true);
+                }
+                else {
+                    this->_bomPromise.set_value(false);
                 }
 
                 this->unicode_bom_scan = true;
             }
         }
+
 #ifdef _MSC_VER
 #pragma endregion
 #endif
@@ -7204,7 +8379,7 @@ namespace csv {
 #ifdef _MSC_VER
 #pragma region Specializations
 #endif
-        CSV_INLINE void StringViewParser::next(size_t bytes /* = ITERATION_CHUNK_SIZE*/) {
+        CSV_INLINE void StringViewParser::next() {
             if (this->eof()) return;
 
             this->reset_data_ptr();
@@ -7214,32 +8389,29 @@ namespace csv {
             }
 
             // Read data into buffer
-            size_t length = std::min(source_size - stream_pos, bytes);
-
+            size_t length = std::min(source_size - stream_pos, this->_iteration_chunk_size);
             stream_pos = this->data_ptr->CreateStringViewSource(_source, stream_pos, length);
 
             // Parse
             this->current_row = CSVRow(this->data_ptr);
-            bool forceNewline = (stream_pos + bytes >= source_size);
+            bool forceNewline = (stream_pos + this->_iteration_chunk_size >= source_size);
             size_t completed = this->parse(forceNewline);
             this->stream_pos -= (length - completed);
 
-            // TODO - no_chunk uses a hardcoded ITERATION_CHUNK_SIZE, which
-            // isn't always accurate. One example is for get_csv_head().
-            // no_chunk() is required for get_csv_head() to succeed.
-            if (stream_pos == source_size || no_chunk(bytes)) {
+            if (eof() || stream_pos == source_size || no_chunk()) {
                 this->_eof = true;
                 this->end_feed();
             }
         }
 
-        CSV_INLINE void MmapParser::next(size_t bytes = ITERATION_CHUNK_SIZE) {
+        CSV_INLINE void MmapParser::next() {
             // Reset parser state
             this->field_start = UNINITIALIZED_FIELD;
             this->field_length = 0;
             this->reset_data_ptr();
 
-            size_t length = std::min(this->source_size - this->mmap_pos, bytes);
+            size_t length = std::min(this->source_size - this->mmap_pos, this->_iteration_chunk_size);
+            const bool forceNewline = length < this->_iteration_chunk_size;
             if (length > 0) {
                 // Create memory map
                 this->mmap_pos = this->data_ptr->CreateMmapSource(this->_filename, this->mmap_pos, length);
@@ -7247,15 +8419,11 @@ namespace csv {
                 // Parse
                 this->current_row = CSVRow(this->data_ptr);
                 // If we are at the end of the file, parse the last line even if there's no newline
-                bool forceNewline = length < bytes;
                 size_t completed = this->parse(forceNewline);
                 this->mmap_pos -= (length - completed);
             }
 
-            // TODO - no_chunk uses a hardcoded ITERATION_CHUNK_SIZE, which
-            // isn't always accurate. One example is for get_csv_head().
-            // no_chunk() is required for get_csv_head() to succeed.
-            if (this->mmap_pos == this->source_size || no_chunk(bytes)) {
+            if (this->mmap_pos == this->source_size || no_chunk()) {
                 this->_eof = true;
                 this->end_feed();
             }
@@ -7393,19 +8561,6 @@ namespace csv {
 
 namespace csv {
     namespace internals {
-        CSV_INLINE std::string format_row(const std::vector<std::string>& row, csv::string_view delim) {
-            /** Print a CSV row */
-            std::stringstream ret;
-            for (size_t i = 0; i < row.size(); i++) {
-                ret << row[i];
-                if (i + 1 < row.size()) ret << delim;
-                else ret << '\n';
-            }
-            ret.flush();
-
-            return ret.str();
-        }
-
         /** Return a CSV's column names
          *
          *  @param[in] filename  Path to CSV file
@@ -7415,13 +8570,14 @@ namespace csv {
         CSV_INLINE std::vector<std::string> _get_col_names(csv::string_view head, CSVFormat format) {
             // Parse the CSV
             auto trim_chars = format.get_trim_chars();
-            RowCollection rows;
 
             StringViewParser parser(head, format);
-            parser.set_output(rows);
-            parser.next();
+            parser.set_max_rows(format.get_header()+1);
+            parser.read_csv();
 
-            return CSVRow(std::move(rows[format.get_header()]));
+            CSVRow row;
+            while (parser._channel.try_dequeue(row)) {}
+            return std::move(row);
         }
 
         CSV_INLINE GuessScore calculate_score(csv::string_view head, CSVFormat format) {
@@ -7431,16 +8587,14 @@ namespace csv {
             // Map row lengths to row num where they first occurred
             std::unordered_map<size_t, size_t> row_when = { { 0, 0 } };
 
-            RowCollection rows;
-
-            // Parse the CSV
+            // Parse the CSV. We are parsing in the current thread, so once next()
+            // completes, the data in _channel will not update asynchronously.
             StringViewParser parser(head, format);
-            parser.set_output(rows);
-            parser.next();
+            parser.set_max_rows(30);
+            parser.read_csv();
 
-            for (size_t i = 0; i < rows.size(); i++) {
-                auto& row = rows[i];
-
+            CSVRow row;
+            for (int i = 0; parser._channel.try_dequeue(row); ++i) {
                 // Ignore zero-length rows
                 if (row.size() > 0) {
                     if (row_tally.find(row.size()) != row_tally.end()) {
@@ -7453,7 +8607,7 @@ namespace csv {
                 }
             }
 
-            double final_score = 0;
+            double final_score = 0.0;
             size_t header_row = 0;
 
             // Final score is equal to the largest
@@ -7536,23 +8690,24 @@ namespace csv {
      *  \snippet tests/test_read_csv.cpp CSVField Example
      *
      */
-	CSV_INLINE CSVReader::CSVReader(csv::string_view filename, CSVFormat format) : _format(format) {
-        auto head = internals::get_csv_head(filename);
-        using Parser = internals::MmapParser;
-
+	CSV_INLINE CSVReader::CSVReader(csv::string_view filename, CSVFormat format) {
         /** Guess delimiter and header row */
         if (format.guess_delim()) {
+            auto head = internals::get_csv_head(filename);
             auto guess_result = internals::_guess_format(head, format.possible_delimiters);
             format.delimiter(guess_result.delim);
             format.header = guess_result.header_row;
-            this->_format = format;
         }
+
+        this->parser = std::unique_ptr<internals::MmapParser>(
+            new internals::MmapParser(filename, format, this->col_names)); // For C++11
+
+        this->_format = format;
 
         if (!format.col_names.empty())
             this->set_col_names(format.col_names);
 
-        this->parser = std::unique_ptr<Parser>(new Parser(filename, format, this->col_names)); // For C++11
-        this->initial_read();
+        launch_worker_thread();
     }
 
     /** Return the format of the original raw CSV */
@@ -7588,19 +8743,32 @@ namespace csv {
         return CSV_NOT_FOUND;
     }
 
-    CSV_INLINE void CSVReader::trim_header() {
-        if (!this->header_trimmed) {
-            for (int i = 0; i <= this->_format.header && !this->records->empty(); i++) {
-                if (i == this->_format.header && this->col_names->empty()) {
-                    this->set_col_names(this->records->pop_front());
-                }
-                else {
-                    this->records->pop_front();
-                }
-            }
-
-            this->header_trimmed = true;
+    CSV_INLINE bool CSVReader::trim_header() {
+        if (this->header_trimmed)
+        {
+            return true;
         }
+
+        auto policy = this->_format.variable_column_policy;
+        this->_format.variable_column_policy = VariableColumnPolicy::KEEP;
+
+        bool success = true;
+        for (int i = 0; i <= this->_format.header; i++) {
+            CSVRow row;
+            success = this->read_row(row);
+            if (!success)
+                break;
+            if (i == this->_format.header && this->col_names->empty()) {
+                this->set_col_names(row);
+                this->header_trimmed = true;
+            }
+        }
+
+        // The header lines do not count as data rows.
+        _n_data_rows = 0;
+
+        this->_format.variable_column_policy = policy;
+        return success;
     }
 
     /**
@@ -7612,84 +8780,22 @@ namespace csv {
         this->n_cols = names.size();
     }
 
-    /**
-     * Read a chunk of CSV data.
-     *
-     * @note This method is meant to be run on its own thread. Only one `read_csv()` thread
-     *       should be active at a time.
-     *
-     * @param[in] bytes Number of bytes to read.
-     *
-     * @see CSVReader::read_csv_worker
-     * @see CSVReader::read_row()
-     */
-    CSV_INLINE bool CSVReader::read_csv(size_t bytes) {
-        // Tell read_row() to listen for CSV rows
-        this->records->notify_all();
+    // Will throw an exception if there's an issue with the file, such as it doesn't exist.
+    CSV_INLINE void CSVReader::launch_worker_thread()
+    {
+        this->read_csv_worker = std::thread([this] { this->parser->read_csv(internals::ITERATION_CHUNK_SIZE); });
 
-        this->parser->set_output(*this->records);
-        this->parser->next(bytes);
-
-        if (!this->header_trimmed) {
-            this->trim_header();
+        // TODO - Move this out of the startup path. Maybe to read_row? Careful of recursive call.
+        if (!this->trim_header())
+        {
+            stop_thread_and_join();
+            return;
         }
-
-        // Tell read_row() to stop waiting
-        this->records->kill_all();
-
-        return true;
     }
 
-    /**
-     * Retrieve rows as CSVRow objects, returning true if more rows are available.
-     *
-     * @par Performance Notes
-     *  - Reads chunks of data that are csv::internals::ITERATION_CHUNK_SIZE bytes large at a time
-     *  - For performance details, read the documentation for CSVRow and CSVField.
-     *
-     * @param[out] row The variable where the parsed row will be stored
-     * @see CSVRow, CSVField
-     *
-     * **Example:**
-     * \snippet tests/test_read_csv.cpp CSVField Example
-     *
-     */
-    CSV_INLINE bool CSVReader::read_row(CSVRow &row) {
-        while (true) {
-            if (this->records->empty()) {
-                if (this->records->is_waitable())
-                    // Reading thread is currently active => wait for it to populate records
-                    this->records->wait();
-                else if (this->parser->eof())
-                    // End of file and no more records
-                    return false;
-                else {
-                    // Reading thread is not active => start another one
-                    if (this->read_csv_worker.joinable())
-                        this->read_csv_worker.join();
-
-                    this->read_csv_worker = std::thread(&CSVReader::read_csv, this, internals::ITERATION_CHUNK_SIZE);
-                }
-            }
-            else if (this->records->front().size() != this->n_cols &&
-                this->_format.variable_column_policy != VariableColumnPolicy::KEEP) {
-                auto errored_row = this->records->pop_front();
-
-                if (this->_format.variable_column_policy == VariableColumnPolicy::THROW) {
-                    if (errored_row.size() < this->n_cols)
-                        throw std::runtime_error("Line too short " + internals::format_row(errored_row));
-
-                    throw std::runtime_error("Line too long " + internals::format_row(errored_row));
-                }
-            }
-            else {
-                row = this->records->pop_front();
-                this->_n_rows++;
-                return true;
-            }
-        }
-
-        return false;
+    CSV_INLINE void CSVReader::stop_thread_and_join()
+    {
+        this->parser->stop_thread_and_join(this->read_csv_worker);
     }
 }
 
@@ -7699,17 +8805,43 @@ namespace csv {
 
 
 namespace csv {
+    CSV_INLINE bool CSVReader::read_row(CSVRow& row) {
+        bool b{};
+        for (;;) {
+            b = this->parser->queue_reader.read_row(row);
+            if (!b) {
+                break;
+            }
+            if (row.size() == this->n_cols) {
+                ++_n_data_rows;
+                break;
+            }
+            switch (this->_format.variable_column_policy) {
+            case VariableColumnPolicy::KEEP:
+                ++_n_data_rows;
+                return true;
+
+            case VariableColumnPolicy::IGNORE_ROW:
+                continue;
+
+            case VariableColumnPolicy::THROW:
+                if (row.size() < this->n_cols)
+                    throw std::runtime_error("Line too short " + internals::format_row(row));
+
+                throw std::runtime_error("Line too long " + internals::format_row(row));
+            }
+        }
+        return b;
+    }
+
     /** Return an iterator to the first row in the reader */
     CSV_INLINE CSVReader::iterator CSVReader::begin() {
-        if (this->records->empty()) {
-            this->read_csv_worker = std::thread(&CSVReader::read_csv, this, internals::ITERATION_CHUNK_SIZE);
-            this->read_csv_worker.join();
-
-            // Still empty => return end iterator
-            if (this->records->empty()) return this->end();
+        CSVRow row;
+        if (!read_row(row)) {
+            return this->end();
         }
 
-        CSVReader::iterator ret(this, this->records->pop_front());
+        CSVReader::iterator ret(this, std::move(row));
         return ret;
     }
 
@@ -7848,11 +8980,11 @@ namespace csv {
             throw std::runtime_error("Index out of bounds.");
 
         const size_t field_index = this->fields_start + index;
-        auto& field = this->data->fields[field_index];
+        auto& field = this->fields[field_index];
         auto field_str = csv::string_view(this->data->data).substr(this->data_start + field.start);
 
         if (field.has_double_quote) {
-            auto& value = this->data->double_quote_fields[field_index];
+            auto& value = this->double_quote_fields[field_index];
             if (value.empty()) {
                 bool prev_ch_quote = false;
                 for (size_t i = 0; i < field.length; i++) {
@@ -8643,4 +9775,981 @@ namespace csv {
 }
 
 
+#endif// ©2013-2020 Cameron Desrochers.
+// Distributed under the simplified BSD license (see the license file that
+// should have come with this header).
+
+
+#include <new>
+#include <type_traits>
+#include <utility>
+#include <cassert>
+#include <stdexcept>
+#include <new>
+#include <cstdint>
+#include <cstdlib>		// For malloc/free/abort & size_t
+#include <memory>
+#if __cplusplus > 199711L || _MSC_VER >= 1700 // C++11 or VS2012
+#include <chrono>
 #endif
+
+
+// A lock-free queue for a single-consumer, single-producer architecture.
+// The queue is also wait-free in the common path (except if more memory
+// needs to be allocated, in which case malloc is called).
+// Allocates memory sparingly, and only once if the original maximum size
+// estimate is never exceeded.
+// Tested on x86/x64 processors, but semantics should be correct for all
+// architectures (given the right implementations in atomicops.h), provided
+// that aligned integer and pointer accesses are naturally atomic.
+// Note that there should only be one consumer thread and producer thread;
+// Switching roles of the threads, or using multiple consecutive threads for
+// one role, is not safe unless properly synchronized.
+// Using the queue exclusively from one thread is fine, though a bit silly.
+
+#ifndef MOODYCAMEL_CACHE_LINE_SIZE
+#define MOODYCAMEL_CACHE_LINE_SIZE 64
+#endif
+
+#ifndef MOODYCAMEL_EXCEPTIONS_ENABLED
+#if (defined(_MSC_VER) && defined(_CPPUNWIND)) || (defined(__GNUC__) && defined(__EXCEPTIONS)) || (!defined(_MSC_VER) && !defined(__GNUC__))
+#define MOODYCAMEL_EXCEPTIONS_ENABLED
+#endif
+#endif
+
+#ifndef MOODYCAMEL_HAS_EMPLACE
+#if !defined(_MSC_VER) || _MSC_VER >= 1800 // variadic templates: either a non-MS compiler or VS >= 2013
+#define MOODYCAMEL_HAS_EMPLACE    1
+#endif
+#endif
+
+#ifndef MOODYCAMEL_MAYBE_ALIGN_TO_CACHELINE
+#if defined (__APPLE__) && defined (__MACH__) && __cplusplus >= 201703L
+// This is required to find out what deployment target we are using
+#include <CoreFoundation/CoreFoundation.h>
+#if !defined(MAC_OS_X_VERSION_MIN_REQUIRED) || MAC_OS_X_VERSION_MIN_REQUIRED < MAC_OS_X_VERSION_10_14
+// C++17 new(size_t, align_val_t) is not backwards-compatible with older versions of macOS, so we can't support over-alignment in this case
+#define MOODYCAMEL_MAYBE_ALIGN_TO_CACHELINE
+#endif
+#endif
+#endif
+
+#ifndef MOODYCAMEL_MAYBE_ALIGN_TO_CACHELINE
+#define MOODYCAMEL_MAYBE_ALIGN_TO_CACHELINE AE_ALIGN(MOODYCAMEL_CACHE_LINE_SIZE)
+#endif
+
+#ifdef AE_VCPP
+#pragma warning(push)
+#pragma warning(disable: 4324)	// structure was padded due to __declspec(align())
+#pragma warning(disable: 4820)	// padding was added
+#pragma warning(disable: 4127)	// conditional expression is constant
+#endif
+
+namespace moodycamel {
+
+template<typename T, size_t MAX_BLOCK_SIZE = 512>
+class MOODYCAMEL_MAYBE_ALIGN_TO_CACHELINE ReaderWriterQueue
+{
+	// Design: Based on a queue-of-queues. The low-level queues are just
+	// circular buffers with front and tail indices indicating where the
+	// next element to dequeue is and where the next element can be enqueued,
+	// respectively. Each low-level queue is called a "block". Each block
+	// wastes exactly one element's worth of space to keep the design simple
+	// (if front == tail then the queue is empty, and can't be full).
+	// The high-level queue is a circular linked list of blocks; again there
+	// is a front and tail, but this time they are pointers to the blocks.
+	// The front block is where the next element to be dequeued is, provided
+	// the block is not empty. The back block is where elements are to be
+	// enqueued, provided the block is not full.
+	// The producer thread owns all the tail indices/pointers. The consumer
+	// thread owns all the front indices/pointers. Both threads read each
+	// other's variables, but only the owning thread updates them. E.g. After
+	// the consumer reads the producer's tail, the tail may change before the
+	// consumer is done dequeuing an object, but the consumer knows the tail
+	// will never go backwards, only forwards.
+	// If there is no room to enqueue an object, an additional block (of
+	// equal size to the last block) is added. Blocks are never removed.
+
+public:
+	typedef T value_type;
+
+	// Constructs a queue that can hold at least `size` elements without further
+	// allocations. If more than MAX_BLOCK_SIZE elements are requested,
+	// then several blocks of MAX_BLOCK_SIZE each are reserved (including
+	// at least one extra buffer block).
+	AE_NO_TSAN explicit ReaderWriterQueue(size_t size = 15)
+#ifndef NDEBUG
+		: enqueuing(false)
+		,dequeuing(false)
+#endif
+	{
+		assert(MAX_BLOCK_SIZE == ceilToPow2(MAX_BLOCK_SIZE) && "MAX_BLOCK_SIZE must be a power of 2");
+		assert(MAX_BLOCK_SIZE >= 2 && "MAX_BLOCK_SIZE must be at least 2");
+		
+		Block* firstBlock = nullptr;
+		
+		largestBlockSize = ceilToPow2(size + 1);		// We need a spare slot to fit size elements in the block
+		if (largestBlockSize > MAX_BLOCK_SIZE * 2) {
+			// We need a spare block in case the producer is writing to a different block the consumer is reading from, and
+			// wants to enqueue the maximum number of elements. We also need a spare element in each block to avoid the ambiguity
+			// between front == tail meaning "empty" and "full".
+			// So the effective number of slots that are guaranteed to be usable at any time is the block size - 1 times the
+			// number of blocks - 1. Solving for size and applying a ceiling to the division gives us (after simplifying):
+			size_t initialBlockCount = (size + MAX_BLOCK_SIZE * 2 - 3) / (MAX_BLOCK_SIZE - 1);
+			largestBlockSize = MAX_BLOCK_SIZE;
+			Block* lastBlock = nullptr;
+			for (size_t i = 0; i != initialBlockCount; ++i) {
+				auto block = make_block(largestBlockSize);
+				if (block == nullptr) {
+#ifdef MOODYCAMEL_EXCEPTIONS_ENABLED
+					throw std::bad_alloc();
+#else
+					abort();
+#endif
+				}
+				if (firstBlock == nullptr) {
+					firstBlock = block;
+				}
+				else {
+					lastBlock->next = block;
+				}
+				lastBlock = block;
+				block->next = firstBlock;
+			}
+		}
+		else {
+			firstBlock = make_block(largestBlockSize);
+			if (firstBlock == nullptr) {
+#ifdef MOODYCAMEL_EXCEPTIONS_ENABLED
+				throw std::bad_alloc();
+#else
+				abort();
+#endif
+			}
+			firstBlock->next = firstBlock;
+		}
+		frontBlock = firstBlock;
+		tailBlock = firstBlock;
+		
+		// Make sure the reader/writer threads will have the initialized memory setup above:
+		fence(memory_order_sync);
+	}
+
+	// Note: The queue should not be accessed concurrently while it's
+	// being moved. It's up to the user to synchronize this.
+	AE_NO_TSAN ReaderWriterQueue(ReaderWriterQueue&& other)
+		: frontBlock(other.frontBlock.load()),
+		tailBlock(other.tailBlock.load()),
+		largestBlockSize(other.largestBlockSize)
+#ifndef NDEBUG
+		,enqueuing(false)
+		,dequeuing(false)
+#endif
+	{
+		other.largestBlockSize = 32;
+		Block* b = other.make_block(other.largestBlockSize);
+		if (b == nullptr) {
+#ifdef MOODYCAMEL_EXCEPTIONS_ENABLED
+			throw std::bad_alloc();
+#else
+			abort();
+#endif
+		}
+		b->next = b;
+		other.frontBlock = b;
+		other.tailBlock = b;
+	}
+
+	// Note: The queue should not be accessed concurrently while it's
+	// being moved. It's up to the user to synchronize this.
+	ReaderWriterQueue& operator=(ReaderWriterQueue&& other) AE_NO_TSAN
+	{
+		Block* b = frontBlock.load();
+		frontBlock = other.frontBlock.load();
+		other.frontBlock = b;
+		b = tailBlock.load();
+		tailBlock = other.tailBlock.load();
+		other.tailBlock = b;
+		std::swap(largestBlockSize, other.largestBlockSize);
+		return *this;
+	}
+
+	// Note: The queue should not be accessed concurrently while it's
+	// being deleted. It's up to the user to synchronize this.
+	AE_NO_TSAN ~ReaderWriterQueue()
+	{
+		// Make sure we get the latest version of all variables from other CPUs:
+		fence(memory_order_sync);
+
+		// Destroy any remaining objects in queue and free memory
+		Block* frontBlock_ = frontBlock;
+		Block* block = frontBlock_;
+		do {
+			Block* nextBlock = block->next;
+			size_t blockFront = block->front;
+			size_t blockTail = block->tail;
+
+			for (size_t i = blockFront; i != blockTail; i = (i + 1) & block->sizeMask) {
+				auto element = reinterpret_cast<T*>(block->data + i * sizeof(T));
+				element->~T();
+				(void)element;
+			}
+			
+			auto rawBlock = block->rawThis;
+			block->~Block();
+			std::free(rawBlock);
+			block = nextBlock;
+		} while (block != frontBlock_);
+	}
+
+
+	// Enqueues a copy of element if there is room in the queue.
+	// Returns true if the element was enqueued, false otherwise.
+	// Does not allocate memory.
+	AE_FORCEINLINE bool try_enqueue(T const& element) AE_NO_TSAN
+	{
+		return inner_enqueue<CannotAlloc>(element);
+	}
+
+	// Enqueues a moved copy of element if there is room in the queue.
+	// Returns true if the element was enqueued, false otherwise.
+	// Does not allocate memory.
+	AE_FORCEINLINE bool try_enqueue(T&& element) AE_NO_TSAN
+	{
+		return inner_enqueue<CannotAlloc>(std::forward<T>(element));
+	}
+
+#if MOODYCAMEL_HAS_EMPLACE
+	// Like try_enqueue() but with emplace semantics (i.e. construct-in-place).
+	template<typename... Args>
+	AE_FORCEINLINE bool try_emplace(Args&&... args) AE_NO_TSAN
+	{
+		return inner_enqueue<CannotAlloc>(std::forward<Args>(args)...);
+	}
+#endif
+
+	// Enqueues a copy of element on the queue.
+	// Allocates an additional block of memory if needed.
+	// Only fails (returns false) if memory allocation fails.
+	AE_FORCEINLINE bool enqueue(T const& element) AE_NO_TSAN
+	{
+		return inner_enqueue<CanAlloc>(element);
+	}
+
+	// Enqueues a moved copy of element on the queue.
+	// Allocates an additional block of memory if needed.
+	// Only fails (returns false) if memory allocation fails.
+	AE_FORCEINLINE bool enqueue(T&& element) AE_NO_TSAN
+	{
+		return inner_enqueue<CanAlloc>(std::forward<T>(element));
+	}
+
+#if MOODYCAMEL_HAS_EMPLACE
+	// Like enqueue() but with emplace semantics (i.e. construct-in-place).
+	template<typename... Args>
+	AE_FORCEINLINE bool emplace(Args&&... args) AE_NO_TSAN
+	{
+		return inner_enqueue<CanAlloc>(std::forward<Args>(args)...);
+	}
+#endif
+
+	// Attempts to dequeue an element; if the queue is empty,
+	// returns false instead. If the queue has at least one element,
+	// moves front to result using operator=, then returns true.
+	template<typename U>
+	bool try_dequeue(U& result) AE_NO_TSAN
+	{
+#ifndef NDEBUG
+		ReentrantGuard guard(this->dequeuing);
+#endif
+
+		// High-level pseudocode:
+		// Remember where the tail block is
+		// If the front block has an element in it, dequeue it
+		// Else
+		//     If front block was the tail block when we entered the function, return false
+		//     Else advance to next block and dequeue the item there
+
+		// Note that we have to use the value of the tail block from before we check if the front
+		// block is full or not, in case the front block is empty and then, before we check if the
+		// tail block is at the front block or not, the producer fills up the front block *and
+		// moves on*, which would make us skip a filled block. Seems unlikely, but was consistently
+		// reproducible in practice.
+		// In order to avoid overhead in the common case, though, we do a double-checked pattern
+		// where we have the fast path if the front block is not empty, then read the tail block,
+		// then re-read the front block and check if it's not empty again, then check if the tail
+		// block has advanced.
+		
+		Block* frontBlock_ = frontBlock.load();
+		size_t blockTail = frontBlock_->localTail;
+		size_t blockFront = frontBlock_->front.load();
+		
+		if (blockFront != blockTail || blockFront != (frontBlock_->localTail = frontBlock_->tail.load())) {
+			fence(memory_order_acquire);
+			
+		non_empty_front_block:
+			// Front block not empty, dequeue from here
+			auto element = reinterpret_cast<T*>(frontBlock_->data + blockFront * sizeof(T));
+			result = std::move(*element);
+			element->~T();
+
+			blockFront = (blockFront + 1) & frontBlock_->sizeMask;
+
+			fence(memory_order_release);
+			frontBlock_->front = blockFront;
+		}
+		else if (frontBlock_ != tailBlock.load()) {
+			fence(memory_order_acquire);
+
+			frontBlock_ = frontBlock.load();
+			blockTail = frontBlock_->localTail = frontBlock_->tail.load();
+			blockFront = frontBlock_->front.load();
+			fence(memory_order_acquire);
+			
+			if (blockFront != blockTail) {
+				// Oh look, the front block isn't empty after all
+				goto non_empty_front_block;
+			}
+			
+			// Front block is empty but there's another block ahead, advance to it
+			Block* nextBlock = frontBlock_->next;
+			// Don't need an acquire fence here since next can only ever be set on the tailBlock,
+			// and we're not the tailBlock, and we did an acquire earlier after reading tailBlock which
+			// ensures next is up-to-date on this CPU in case we recently were at tailBlock.
+
+			size_t nextBlockFront = nextBlock->front.load();
+			size_t nextBlockTail = nextBlock->localTail = nextBlock->tail.load();
+			fence(memory_order_acquire);
+
+			// Since the tailBlock is only ever advanced after being written to,
+			// we know there's for sure an element to dequeue on it
+			assert(nextBlockFront != nextBlockTail);
+			AE_UNUSED(nextBlockTail);
+
+			// We're done with this block, let the producer use it if it needs
+			fence(memory_order_release);		// Expose possibly pending changes to frontBlock->front from last dequeue
+			frontBlock = frontBlock_ = nextBlock;
+
+			compiler_fence(memory_order_release);	// Not strictly needed
+
+			auto element = reinterpret_cast<T*>(frontBlock_->data + nextBlockFront * sizeof(T));
+			
+			result = std::move(*element);
+			element->~T();
+
+			nextBlockFront = (nextBlockFront + 1) & frontBlock_->sizeMask;
+			
+			fence(memory_order_release);
+			frontBlock_->front = nextBlockFront;
+		}
+		else {
+			// No elements in current block and no other block to advance to
+			return false;
+		}
+
+		return true;
+	}
+
+
+	// Returns a pointer to the front element in the queue (the one that
+	// would be removed next by a call to `try_dequeue` or `pop`). If the
+	// queue appears empty at the time the method is called, nullptr is
+	// returned instead.
+	// Must be called only from the consumer thread.
+	T* peek() const AE_NO_TSAN
+	{
+#ifndef NDEBUG
+		ReentrantGuard guard(this->dequeuing);
+#endif
+		// See try_dequeue() for reasoning
+
+		Block* frontBlock_ = frontBlock.load();
+		size_t blockTail = frontBlock_->localTail;
+		size_t blockFront = frontBlock_->front.load();
+		
+		if (blockFront != blockTail || blockFront != (frontBlock_->localTail = frontBlock_->tail.load())) {
+			fence(memory_order_acquire);
+		non_empty_front_block:
+			return reinterpret_cast<T*>(frontBlock_->data + blockFront * sizeof(T));
+		}
+		else if (frontBlock_ != tailBlock.load()) {
+			fence(memory_order_acquire);
+			frontBlock_ = frontBlock.load();
+			blockTail = frontBlock_->localTail = frontBlock_->tail.load();
+			blockFront = frontBlock_->front.load();
+			fence(memory_order_acquire);
+			
+			if (blockFront != blockTail) {
+				goto non_empty_front_block;
+			}
+			
+			Block* nextBlock = frontBlock_->next;
+			
+			size_t nextBlockFront = nextBlock->front.load();
+			fence(memory_order_acquire);
+
+			assert(nextBlockFront != nextBlock->tail.load());
+			return reinterpret_cast<T*>(nextBlock->data + nextBlockFront * sizeof(T));
+		}
+		
+		return nullptr;
+	}
+	
+	// Removes the front element from the queue, if any, without returning it.
+	// Returns true on success, or false if the queue appeared empty at the time
+	// `pop` was called.
+	bool pop() AE_NO_TSAN
+	{
+#ifndef NDEBUG
+		ReentrantGuard guard(this->dequeuing);
+#endif
+		// See try_dequeue() for reasoning
+		
+		Block* frontBlock_ = frontBlock.load();
+		size_t blockTail = frontBlock_->localTail;
+		size_t blockFront = frontBlock_->front.load();
+		
+		if (blockFront != blockTail || blockFront != (frontBlock_->localTail = frontBlock_->tail.load())) {
+			fence(memory_order_acquire);
+			
+		non_empty_front_block:
+			auto element = reinterpret_cast<T*>(frontBlock_->data + blockFront * sizeof(T));
+			element->~T();
+
+			blockFront = (blockFront + 1) & frontBlock_->sizeMask;
+
+			fence(memory_order_release);
+			frontBlock_->front = blockFront;
+		}
+		else if (frontBlock_ != tailBlock.load()) {
+			fence(memory_order_acquire);
+			frontBlock_ = frontBlock.load();
+			blockTail = frontBlock_->localTail = frontBlock_->tail.load();
+			blockFront = frontBlock_->front.load();
+			fence(memory_order_acquire);
+			
+			if (blockFront != blockTail) {
+				goto non_empty_front_block;
+			}
+			
+			// Front block is empty but there's another block ahead, advance to it
+			Block* nextBlock = frontBlock_->next;
+			
+			size_t nextBlockFront = nextBlock->front.load();
+			size_t nextBlockTail = nextBlock->localTail = nextBlock->tail.load();
+			fence(memory_order_acquire);
+
+			assert(nextBlockFront != nextBlockTail);
+			AE_UNUSED(nextBlockTail);
+
+			fence(memory_order_release);
+			frontBlock = frontBlock_ = nextBlock;
+
+			compiler_fence(memory_order_release);
+
+			auto element = reinterpret_cast<T*>(frontBlock_->data + nextBlockFront * sizeof(T));
+			element->~T();
+
+			nextBlockFront = (nextBlockFront + 1) & frontBlock_->sizeMask;
+			
+			fence(memory_order_release);
+			frontBlock_->front = nextBlockFront;
+		}
+		else {
+			// No elements in current block and no other block to advance to
+			return false;
+		}
+
+		return true;
+	}
+	
+	// Returns the approximate number of items currently in the queue.
+	// Safe to call from both the producer and consumer threads.
+	inline size_t size_approx() const AE_NO_TSAN
+	{
+		size_t result = 0;
+		Block* frontBlock_ = frontBlock.load();
+		Block* block = frontBlock_;
+		do {
+			fence(memory_order_acquire);
+			size_t blockFront = block->front.load();
+			size_t blockTail = block->tail.load();
+			result += (blockTail - blockFront) & block->sizeMask;
+			block = block->next.load();
+		} while (block != frontBlock_);
+		return result;
+	}
+
+	// Returns the total number of items that could be enqueued without incurring
+	// an allocation when this queue is empty.
+	// Safe to call from both the producer and consumer threads.
+	//
+	// NOTE: The actual capacity during usage may be different depending on the consumer.
+	//       If the consumer is removing elements concurrently, the producer cannot add to
+	//       the block the consumer is removing from until it's completely empty, except in
+	//       the case where the producer was writing to the same block the consumer was
+	//       reading from the whole time.
+	inline size_t max_capacity() const {
+		size_t result = 0;
+		Block* frontBlock_ = frontBlock.load();
+		Block* block = frontBlock_;
+		do {
+			fence(memory_order_acquire);
+			result += block->sizeMask;
+			block = block->next.load();
+		} while (block != frontBlock_);
+		return result;
+	}
+
+
+private:
+	enum AllocationMode { CanAlloc, CannotAlloc };
+
+#if MOODYCAMEL_HAS_EMPLACE
+	template<AllocationMode canAlloc, typename... Args>
+	bool inner_enqueue(Args&&... args) AE_NO_TSAN
+#else
+	template<AllocationMode canAlloc, typename U>
+	bool inner_enqueue(U&& element) AE_NO_TSAN
+#endif
+	{
+#ifndef NDEBUG
+		ReentrantGuard guard(this->enqueuing);
+#endif
+
+		// High-level pseudocode (assuming we're allowed to alloc a new block):
+		// If room in tail block, add to tail
+		// Else check next block
+		//     If next block is not the head block, enqueue on next block
+		//     Else create a new block and enqueue there
+		//     Advance tail to the block we just enqueued to
+
+		Block* tailBlock_ = tailBlock.load();
+		size_t blockFront = tailBlock_->localFront;
+		size_t blockTail = tailBlock_->tail.load();
+
+		size_t nextBlockTail = (blockTail + 1) & tailBlock_->sizeMask;
+		if (nextBlockTail != blockFront || nextBlockTail != (tailBlock_->localFront = tailBlock_->front.load())) {
+			fence(memory_order_acquire);
+			// This block has room for at least one more element
+			char* location = tailBlock_->data + blockTail * sizeof(T);
+#if MOODYCAMEL_HAS_EMPLACE
+			new (location) T(std::forward<Args>(args)...);
+#else
+			new (location) T(std::forward<U>(element));
+#endif
+
+			fence(memory_order_release);
+			tailBlock_->tail = nextBlockTail;
+		}
+		else {
+			fence(memory_order_acquire);
+			if (tailBlock_->next.load() != frontBlock) {
+				// Note that the reason we can't advance to the frontBlock and start adding new entries there
+				// is because if we did, then dequeue would stay in that block, eventually reading the new values,
+				// instead of advancing to the next full block (whose values were enqueued first and so should be
+				// consumed first).
+
+				fence(memory_order_acquire);		// Ensure we get latest writes if we got the latest frontBlock
+
+				// tailBlock is full, but there's a free block ahead, use it
+				Block* tailBlockNext = tailBlock_->next.load();
+				size_t nextBlockFront = tailBlockNext->localFront = tailBlockNext->front.load();
+				nextBlockTail = tailBlockNext->tail.load();
+				fence(memory_order_acquire);
+
+				// This block must be empty since it's not the head block and we
+				// go through the blocks in a circle
+				assert(nextBlockFront == nextBlockTail);
+				tailBlockNext->localFront = nextBlockFront;
+
+				char* location = tailBlockNext->data + nextBlockTail * sizeof(T);
+#if MOODYCAMEL_HAS_EMPLACE
+				new (location) T(std::forward<Args>(args)...);
+#else
+				new (location) T(std::forward<U>(element));
+#endif
+
+				tailBlockNext->tail = (nextBlockTail + 1) & tailBlockNext->sizeMask;
+
+				fence(memory_order_release);
+				tailBlock = tailBlockNext;
+			}
+			else if (canAlloc == CanAlloc) {
+				// tailBlock is full and there's no free block ahead; create a new block
+				auto newBlockSize = largestBlockSize >= MAX_BLOCK_SIZE ? largestBlockSize : largestBlockSize * 2;
+				auto newBlock = make_block(newBlockSize);
+				if (newBlock == nullptr) {
+					// Could not allocate a block!
+					return false;
+				}
+				largestBlockSize = newBlockSize;
+
+#if MOODYCAMEL_HAS_EMPLACE
+				new (newBlock->data) T(std::forward<Args>(args)...);
+#else
+				new (newBlock->data) T(std::forward<U>(element));
+#endif
+				assert(newBlock->front == 0);
+				newBlock->tail = newBlock->localTail = 1;
+
+				newBlock->next = tailBlock_->next.load();
+				tailBlock_->next = newBlock;
+
+				// Might be possible for the dequeue thread to see the new tailBlock->next
+				// *without* seeing the new tailBlock value, but this is OK since it can't
+				// advance to the next block until tailBlock is set anyway (because the only
+				// case where it could try to read the next is if it's already at the tailBlock,
+				// and it won't advance past tailBlock in any circumstance).
+
+				fence(memory_order_release);
+				tailBlock = newBlock;
+			}
+			else if (canAlloc == CannotAlloc) {
+				// Would have had to allocate a new block to enqueue, but not allowed
+				return false;
+			}
+			else {
+				assert(false && "Should be unreachable code");
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+
+	// Disable copying
+	ReaderWriterQueue(ReaderWriterQueue const&) {  }
+
+	// Disable assignment
+	ReaderWriterQueue& operator=(ReaderWriterQueue const&) {  }
+
+
+	AE_FORCEINLINE static size_t ceilToPow2(size_t x)
+	{
+		// From http://graphics.stanford.edu/~seander/bithacks.html#RoundUpPowerOf2
+		--x;
+		x |= x >> 1;
+		x |= x >> 2;
+		x |= x >> 4;
+		for (size_t i = 1; i < sizeof(size_t); i <<= 1) {
+			x |= x >> (i << 3);
+		}
+		++x;
+		return x;
+	}
+	
+	template<typename U>
+	static AE_FORCEINLINE char* align_for(char* ptr) AE_NO_TSAN
+	{
+		const std::size_t alignment = std::alignment_of<U>::value;
+		return ptr + (alignment - (reinterpret_cast<std::uintptr_t>(ptr) % alignment)) % alignment;
+	}
+private:
+#ifndef NDEBUG
+	struct ReentrantGuard
+	{
+		AE_NO_TSAN ReentrantGuard(weak_atomic<bool>& _inSection)
+			: inSection(_inSection)
+		{
+			assert(!inSection && "Concurrent (or re-entrant) enqueue or dequeue operation detected (only one thread at a time may hold the producer or consumer role)");
+			inSection = true;
+		}
+
+		AE_NO_TSAN ~ReentrantGuard() { inSection = false; }
+
+	private:
+		ReentrantGuard& operator=(ReentrantGuard const&);
+
+	private:
+		weak_atomic<bool>& inSection;
+	};
+#endif
+
+	struct Block
+	{
+		// Avoid false-sharing by putting highly contended variables on their own cache lines
+		weak_atomic<size_t> front;	// (Atomic) Elements are read from here
+		size_t localTail;			// An uncontended shadow copy of tail, owned by the consumer
+		
+		char cachelineFiller0[MOODYCAMEL_CACHE_LINE_SIZE - sizeof(weak_atomic<size_t>) - sizeof(size_t)];
+		weak_atomic<size_t> tail;	// (Atomic) Elements are enqueued here
+		size_t localFront;
+		
+		char cachelineFiller1[MOODYCAMEL_CACHE_LINE_SIZE - sizeof(weak_atomic<size_t>) - sizeof(size_t)];	// next isn't very contended, but we don't want it on the same cache line as tail (which is)
+		weak_atomic<Block*> next;	// (Atomic)
+		
+		char* data;		// Contents (on heap) are aligned to T's alignment
+
+		const size_t sizeMask;
+
+
+		// size must be a power of two (and greater than 0)
+		AE_NO_TSAN Block(size_t const& _size, char* _rawThis, char* _data)
+			: front(0UL), localTail(0), tail(0UL), localFront(0), next(nullptr), data(_data), sizeMask(_size - 1), rawThis(_rawThis)
+		{
+		}
+
+	private:
+		// C4512 - Assignment operator could not be generated
+		Block& operator=(Block const&);
+
+	public:
+		char* rawThis;
+	};
+	
+	
+	static Block* make_block(size_t capacity) AE_NO_TSAN
+	{
+		// Allocate enough memory for the block itself, as well as all the elements it will contain
+		auto size = sizeof(Block) + std::alignment_of<Block>::value - 1;
+		size += sizeof(T) * capacity + std::alignment_of<T>::value - 1;
+		auto newBlockRaw = static_cast<char*>(std::malloc(size));
+		if (newBlockRaw == nullptr) {
+			return nullptr;
+		}
+		
+		auto newBlockAligned = align_for<Block>(newBlockRaw);
+		auto newBlockData = align_for<T>(newBlockAligned + sizeof(Block));
+		return new (newBlockAligned) Block(capacity, newBlockRaw, newBlockData);
+	}
+
+private:
+	weak_atomic<Block*> frontBlock;		// (Atomic) Elements are dequeued from this block
+	
+	char cachelineFiller[MOODYCAMEL_CACHE_LINE_SIZE - sizeof(weak_atomic<Block*>)];
+	weak_atomic<Block*> tailBlock;		// (Atomic) Elements are enqueued to this block
+
+	size_t largestBlockSize;
+
+#ifndef NDEBUG
+	weak_atomic<bool> enqueuing;
+	mutable weak_atomic<bool> dequeuing;
+#endif
+};
+
+// Like ReaderWriterQueue, but also providees blocking operations
+template<typename T, size_t MAX_BLOCK_SIZE = 512>
+class BlockingReaderWriterQueue
+{
+private:
+	typedef ::moodycamel::ReaderWriterQueue<T, MAX_BLOCK_SIZE> ReaderWriterQueue;
+	
+public:
+	explicit BlockingReaderWriterQueue(size_t size = 15) AE_NO_TSAN
+		: inner(size), sema(new spsc_sema::LightweightSemaphore())
+	{ }
+
+	BlockingReaderWriterQueue(BlockingReaderWriterQueue&& other) AE_NO_TSAN
+		: inner(std::move(other.inner)), sema(std::move(other.sema))
+	{ }
+
+	BlockingReaderWriterQueue& operator=(BlockingReaderWriterQueue&& other) AE_NO_TSAN
+	{
+		std::swap(sema, other.sema);
+		std::swap(inner, other.inner);
+		return *this;
+	}
+
+
+	// Enqueues a copy of element if there is room in the queue.
+	// Returns true if the element was enqueued, false otherwise.
+	// Does not allocate memory.
+	AE_FORCEINLINE bool try_enqueue(T const& element) AE_NO_TSAN
+	{
+		if (inner.try_enqueue(element)) {
+			sema->signal();
+			return true;
+		}
+		return false;
+	}
+
+	// Enqueues a moved copy of element if there is room in the queue.
+	// Returns true if the element was enqueued, false otherwise.
+	// Does not allocate memory.
+	AE_FORCEINLINE bool try_enqueue(T&& element) AE_NO_TSAN
+	{
+		if (inner.try_enqueue(std::forward<T>(element))) {
+			sema->signal();
+			return true;
+		}
+		return false;
+	}
+
+#if MOODYCAMEL_HAS_EMPLACE
+	// Like try_enqueue() but with emplace semantics (i.e. construct-in-place).
+	template<typename... Args>
+	AE_FORCEINLINE bool try_emplace(Args&&... args) AE_NO_TSAN
+	{
+		if (inner.try_emplace(std::forward<Args>(args)...)) {
+			sema->signal();
+			return true;
+		}
+		return false;
+	}
+#endif
+
+
+	// Enqueues a copy of element on the queue.
+	// Allocates an additional block of memory if needed.
+	// Only fails (returns false) if memory allocation fails.
+	AE_FORCEINLINE bool enqueue(T const& element) AE_NO_TSAN
+	{
+		if (inner.enqueue(element)) {
+			sema->signal();
+			return true;
+		}
+		return false;
+	}
+
+	// Enqueues a moved copy of element on the queue.
+	// Allocates an additional block of memory if needed.
+	// Only fails (returns false) if memory allocation fails.
+	AE_FORCEINLINE bool enqueue(T&& element) AE_NO_TSAN
+	{
+		if (inner.enqueue(std::forward<T>(element))) {
+			sema->signal();
+			return true;
+		}
+		return false;
+	}
+
+#if MOODYCAMEL_HAS_EMPLACE
+	// Like enqueue() but with emplace semantics (i.e. construct-in-place).
+	template<typename... Args>
+	AE_FORCEINLINE bool emplace(Args&&... args) AE_NO_TSAN
+	{
+		if (inner.emplace(std::forward<Args>(args)...)) {
+			sema->signal();
+			return true;
+		}
+		return false;
+	}
+#endif
+
+
+	// Attempts to dequeue an element; if the queue is empty,
+	// returns false instead. If the queue has at least one element,
+	// moves front to result using operator=, then returns true.
+	template<typename U>
+	bool try_dequeue(U& result) AE_NO_TSAN
+	{
+		if (sema->tryWait()) {
+			bool success = inner.try_dequeue(result);
+			assert(success);
+			AE_UNUSED(success);
+			return true;
+		}
+		return false;
+	}
+	
+	
+	// Attempts to dequeue an element; if the queue is empty,
+	// waits until an element is available, then dequeues it.
+	template<typename U>
+	void wait_dequeue(U& result) AE_NO_TSAN
+	{
+		while (!sema->wait());
+		bool success = inner.try_dequeue(result);
+		AE_UNUSED(result);
+		assert(success);
+		AE_UNUSED(success);
+	}
+
+
+	// Attempts to dequeue an element; if the queue is empty,
+	// waits until an element is available up to the specified timeout,
+	// then dequeues it and returns true, or returns false if the timeout
+	// expires before an element can be dequeued.
+	// Using a negative timeout indicates an indefinite timeout,
+	// and is thus functionally equivalent to calling wait_dequeue.
+	template<typename U>
+	bool wait_dequeue_timed(U& result, std::int64_t timeout_usecs) AE_NO_TSAN
+	{
+		if (!sema->wait(timeout_usecs)) {
+			return false;
+		}
+		bool success = inner.try_dequeue(result);
+		AE_UNUSED(result);
+		assert(success);
+		AE_UNUSED(success);
+		return true;
+	}
+
+
+#if __cplusplus > 199711L || _MSC_VER >= 1700
+	// Attempts to dequeue an element; if the queue is empty,
+	// waits until an element is available up to the specified timeout,
+	// then dequeues it and returns true, or returns false if the timeout
+	// expires before an element can be dequeued.
+	// Using a negative timeout indicates an indefinite timeout,
+	// and is thus functionally equivalent to calling wait_dequeue.
+	template<typename U, typename Rep, typename Period>
+	inline bool wait_dequeue_timed(U& result, std::chrono::duration<Rep, Period> const& timeout) AE_NO_TSAN
+	{
+        return wait_dequeue_timed(result, std::chrono::duration_cast<std::chrono::microseconds>(timeout).count());
+	}
+#endif
+
+
+	// Returns a pointer to the front element in the queue (the one that
+	// would be removed next by a call to `try_dequeue` or `pop`). If the
+	// queue appears empty at the time the method is called, nullptr is
+	// returned instead.
+	// Must be called only from the consumer thread.
+	AE_FORCEINLINE T* peek() const AE_NO_TSAN
+	{
+		return inner.peek();
+	}
+	
+	// Removes the front element from the queue, if any, without returning it.
+	// Returns true on success, or false if the queue appeared empty at the time
+	// `pop` was called.
+	AE_FORCEINLINE bool pop() AE_NO_TSAN
+	{
+		if (sema->tryWait()) {
+			bool result = inner.pop();
+			assert(result);
+			AE_UNUSED(result);
+			return true;
+		}
+		return false;
+	}
+	
+	// Returns the approximate number of items currently in the queue.
+	// Safe to call from both the producer and consumer threads.
+	AE_FORCEINLINE size_t size_approx() const AE_NO_TSAN
+	{
+		return sema->availableApprox();
+	}
+
+	// Returns the total number of items that could be enqueued without incurring
+	// an allocation when this queue is empty.
+	// Safe to call from both the producer and consumer threads.
+	//
+	// NOTE: The actual capacity during usage may be different depending on the consumer.
+	//       If the consumer is removing elements concurrently, the producer cannot add to
+	//       the block the consumer is removing from until it's completely empty, except in
+	//       the case where the producer was writing to the same block the consumer was
+	//       reading from the whole time.
+	AE_FORCEINLINE size_t max_capacity() const {
+		return inner.max_capacity();
+	}
+
+private:
+	// Disable copying & assignment
+	BlockingReaderWriterQueue(BlockingReaderWriterQueue const&) {  }
+	BlockingReaderWriterQueue& operator=(BlockingReaderWriterQueue const&) {  }
+	
+private:
+	ReaderWriterQueue inner;
+	std::unique_ptr<spsc_sema::LightweightSemaphore> sema;
+};
+
+}    // end namespace moodycamel
+
+#ifdef AE_VCPP
+#pragma warning(pop)
+#endif
+

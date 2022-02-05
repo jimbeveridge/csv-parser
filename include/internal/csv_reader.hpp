@@ -5,17 +5,15 @@
 #pragma once
 
 #include <algorithm>
-#include <deque>
-#include <fstream>
+#include <istream>
 #include <iterator>
 #include <memory>
-#include <mutex>
 #include <thread>
-#include <sstream>
 #include <string>
 #include <vector>
 
 #include "../external/mio.hpp"
+#include "../external/readerwritercircularbuffer.h"
 #include "basic_csv_parser.hpp"
 #include "common.hpp"
 #include "data_type.h"
@@ -25,8 +23,6 @@
 namespace csv {
     /** Stuff that is generally not of interest to end-users */
     namespace internals {
-        std::string format_row(const std::vector<std::string>& row, csv::string_view delim = ", ");
-
         std::vector<std::string> _get_col_names( csv::string_view head, const CSVFormat format = CSVFormat::guess_csv());
 
         struct GuessScore {
@@ -87,7 +83,7 @@ namespace csv {
             CONSTEXPR_14 pointer operator->() { return &(this->row); }
 
             iterator& operator++();   /**< Pre-increment iterator */
-            iterator operator++(int); /**< Post-increment ierator */
+            iterator operator++(int); /**< Post-increment iterator */
             iterator& operator--();
 
             /** Returns true if iterators were constructed from the same CSVReader
@@ -126,7 +122,8 @@ namespace csv {
 
             this->parser = std::unique_ptr<Parser>(
                 new Parser(source, format, col_names)); // For C++11
-            this->initial_read();
+
+            launch_worker_thread();
         }
         ///@}
 
@@ -135,19 +132,31 @@ namespace csv {
         CSVReader& operator=(const CSVReader&) = delete; // No copy assignment
         CSVReader& operator=(CSVReader&& other) = default;
         ~CSVReader() {
-            if (this->read_csv_worker.joinable()) {
-                this->read_csv_worker.join();
-            }
+            stop_thread_and_join();
         }
 
         /** @name Retrieving CSV Rows */
         ///@{
-        bool read_row(CSVRow &row);
+        bool read_row(CSVRow& row);
+
         iterator begin();
         HEDLEY_CONST iterator end() const noexcept;
 
-        /** Returns true if we have reached end of file */
-        bool eof() const noexcept { return this->parser->eof(); };
+        /** Returns true if all rows have been returned. This can happen early if set_max_rows() was used.*/
+        bool eof() const noexcept { return this->parser->queue_reader.eof(); };
+
+        /** Read all rows and write to an inserter.
+         */
+        template <class T>
+        void read_collection(T inserter)
+        {
+            CSVRow row;
+            while (this->read_row(row))
+            {
+                *inserter++ = std::move(row);
+            }
+        }
+
         ///@}
 
         /** @name CSV Metadata */
@@ -159,19 +168,12 @@ namespace csv {
 
         /** @name CSV Metadata: Attributes */
         ///@{
-        /** Whether or not the file or stream contains valid CSV rows,
-         *  not including the header.
-         *
-         *  @note Gives an accurate answer regardless of when it is called.
-         *
-         */
-        CONSTEXPR bool empty() const noexcept { return this->n_rows() == 0; }
 
         /** Retrieves the number of rows that have been read so far */
-        CONSTEXPR size_t n_rows() const noexcept { return this->_n_rows; }
+        CONSTEXPR size_t n_rows() const noexcept { return this->_n_data_rows; }
 
         /** Whether or not CSV was prefixed with a UTF-8 bom */
-        bool utf8_bom() const noexcept { return this->parser->utf8_bom(); }
+        bool utf8_bom() const noexcept { return this->parser->queue_reader.utf8_bom(); }
         ///@}
 
     protected:
@@ -196,18 +198,23 @@ namespace csv {
         internals::ColNamesPtr col_names = std::make_shared<internals::ColNames>();
 
         /** Helper class which actually does the parsing */
-        std::unique_ptr<internals::IBasicCSVParser> parser = nullptr;
-
-        /** Queue of parsed CSV rows */
-        std::unique_ptr<RowCollection> records{new RowCollection(100)};
+        std::unique_ptr<internals::IBasicCSVParser> parser;
 
         size_t n_cols = 0;  /**< The number of columns in this CSV */
-        size_t _n_rows = 0; /**< How many rows (minus header) have been read so far */
+        size_t _n_data_rows = 0;  /**< The number of data rows read from this CSV */
 
         /** @name Multi-Threaded File Reading Functions */
         ///@{
         bool read_csv(size_t bytes = internals::ITERATION_CHUNK_SIZE);
         ///@}
+
+        bool trim_header();
+
+        // Will throw an exception if there's an issue with the file, such as it doesn't exist.
+        void launch_worker_thread();
+
+        /** Tell the worker thread to stop and wait until we join */
+        void stop_thread_and_join();
 
         /**@}*/
 
@@ -219,13 +226,5 @@ namespace csv {
         ///@{
         std::thread read_csv_worker; /**< Worker thread for read_csv() */
         ///@}
-
-        /** Read initial chunk to get metadata */
-        void initial_read() {
-            // Read directly so that we don't have to wait for a thread to start.
-            read_csv(1 << 20);
-        }
-
-        void trim_header();
     };
 }

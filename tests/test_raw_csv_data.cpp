@@ -6,7 +6,7 @@
 
 using namespace csv;
 using namespace csv::internals;
-using RowCollectionTest = ThreadSafeDeque<CSVRow>;
+using RowCollectionTest = std::deque<CSVRow>;
 
 TEST_CASE("Basic CSV Parse Test", "[raw_csv_parse]") {
     std::stringstream csv("A,B,C\r\n"
@@ -14,16 +14,16 @@ TEST_CASE("Basic CSV Parse Test", "[raw_csv_parse]") {
         "1,2,3\r\n"
         "1,2,3");
 
-    RowCollectionTest rows;
-
     StreamParser<std::stringstream> parser(
         csv,
         internals::make_parse_flags(',', '"'),
         internals::WhitespaceMap()
     );
 
-    parser.set_output(rows);
-    parser.next();
+    parser.read_csv();
+
+    RowCollectionTest rows;
+    parser.queue_reader.read_collection(back_inserter(rows));
 
     auto row = rows.front();
     REQUIRE(row[0] == "A");
@@ -53,7 +53,7 @@ TEST_CASE("Basic CSV Parse Test", "[raw_csv_parse]") {
     REQUIRE(row.size() == 3);
 }
 
-TEST_CASE("Test Quote Escapes", "[test_parse_quote_escape]") {
+TEST_CASE("Test Quote Escapes", "[raw_csv_parse]") {
     std::stringstream csv(""
         "\"A\",\"B\",\"C\"\r\n"   // Quoted fields w/ no escapes
         "123,\"234,345\",456\r\n" // Escaped comma
@@ -61,16 +61,16 @@ TEST_CASE("Test Quote Escapes", "[test_parse_quote_escape]") {
         "1,\"23\"\"34\",5\r\n"      // Another escaped quote
         "1,\"\",2\r\n");           // Empty Field
 
-    RowCollectionTest rows;
-
     StreamParser<std::stringstream> parser(
         csv,
         internals::make_parse_flags(',', '"'),
         internals::WhitespaceMap()
     );
 
-    parser.set_output(rows);
-    parser.next();
+    parser.read_csv();
+
+    RowCollectionTest rows;
+    parser.queue_reader.read_collection(back_inserter(rows));
 
     auto row = rows.front();
     REQUIRE(row[0] == "A");
@@ -95,6 +95,7 @@ TEST_CASE("Test Quote Escapes", "[test_parse_quote_escape]") {
     rows.pop_front();
     row = rows.front();
     REQUIRE(row[0] == "1");
+    auto row1 = row[1];
     REQUIRE(row[1] == "23\"34");
     REQUIRE(row[2] == "5");
     REQUIRE(row.size() == 3);
@@ -145,7 +146,7 @@ inline std::vector<std::string> make_whitespace_test_cases() {
     return test_cases;
 }
 
-TEST_CASE("Test Parser Whitespace Trimming", "[test_csv_trim]") {
+TEST_CASE("Test Parser Whitespace Trimming", "[raw_csv_parse]") {
     auto row_str = GENERATE(as<std::string> {},
         "A,B,C\r\n" // Header row
         "123,\"234\n,345\",456\r\n",
@@ -178,8 +179,6 @@ TEST_CASE("Test Parser Whitespace Trimming", "[test_csv_trim]") {
     SECTION("Parse Test") {
         using namespace std;
 
-        RowCollectionTest rows;
-
         auto csv = std::stringstream(row_str);
         StreamParser<std::stringstream> parser(
             csv,
@@ -187,8 +186,10 @@ TEST_CASE("Test Parser Whitespace Trimming", "[test_csv_trim]") {
             internals::make_ws_flags({ ' ', '\t' })
         );
 
-        parser.set_output(rows);
-        parser.next();
+        parser.read_csv();
+
+        RowCollectionTest rows;
+        parser.queue_reader.read_collection(back_inserter(rows));
 
         auto header = rows[0];
         REQUIRE(vector<string>(header) == vector<string>(
@@ -203,12 +204,10 @@ TEST_CASE("Test Parser Whitespace Trimming", "[test_csv_trim]") {
     }
 }
 
-TEST_CASE("Test Parser Whitespace Trimming w/ Empty Fields", "[test_raw_ws_trim]") {
+TEST_CASE("Test Parser Whitespace Trimming w/ Empty Fields", "[raw_csv_parse]") {
     auto csv_string = GENERATE(from_range(make_whitespace_test_cases()));
 
     SECTION("Parse Test") {
-        RowCollectionTest rows;
-
         auto csv = std::stringstream(csv_string);
         StreamParser<std::stringstream> parser(
             csv,
@@ -216,9 +215,10 @@ TEST_CASE("Test Parser Whitespace Trimming w/ Empty Fields", "[test_raw_ws_trim]
             internals::make_ws_flags({ ' ', '\t' })
         );
 
-        parser.set_output(rows);
+        parser.read_csv();
 
-        parser.next();
+        RowCollectionTest rows;
+        parser.queue_reader.read_collection(back_inserter(rows));
 
         size_t row_no = 0;
         for (auto& row : rows) {

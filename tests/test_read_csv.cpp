@@ -24,7 +24,8 @@ TEST_CASE( "Test Reading CSV From Direct Input", "[read_csv_direct]" ) {
             "1,2,3"_csv;
 
         CSVRow row;
-        rows.read_row(row);
+        bool success = rows.read_row(row);
+        REQUIRE(success);
         vector<string> first_row = { "123", "234", "345" };
         REQUIRE(vector<string>(row) == first_row);
     }
@@ -520,7 +521,6 @@ TEST_CASE("Empty CSV", "[read_empty_csv]") {
     SECTION("Read Empty CSV") {
         std::stringstream source(csv_string);
         CSVReader reader(source);
-        REQUIRE(reader.empty());
 
         for (auto& row : reader) {
             (void)row;

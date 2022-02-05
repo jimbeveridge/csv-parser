@@ -93,11 +93,11 @@ namespace csv {
             throw std::runtime_error("Index out of bounds.");
 
         const size_t field_index = this->fields_start + index;
-        auto& field = this->data->fields[field_index];
+        auto& field = this->fields[field_index];
         auto field_str = csv::string_view(this->data->data).substr(this->data_start + field.start);
 
         if (field.has_double_quote) {
-            auto& value = this->data->double_quote_fields[field_index];
+            auto& value = this->double_quote_fields[field_index];
             if (value.empty()) {
                 bool prev_ch_quote = false;
                 for (size_t i = 0; i < field.length; i++) {

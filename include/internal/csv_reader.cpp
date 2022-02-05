@@ -6,19 +6,6 @@
 
 namespace csv {
     namespace internals {
-        CSV_INLINE std::string format_row(const std::vector<std::string>& row, csv::string_view delim) {
-            /** Print a CSV row */
-            std::stringstream ret;
-            for (size_t i = 0; i < row.size(); i++) {
-                ret << row[i];
-                if (i + 1 < row.size()) ret << delim;
-                else ret << '\n';
-            }
-            ret.flush();
-
-            return ret.str();
-        }
-
         /** Return a CSV's column names
          *
          *  @param[in] filename  Path to CSV file
@@ -28,13 +15,14 @@ namespace csv {
         CSV_INLINE std::vector<std::string> _get_col_names(csv::string_view head, CSVFormat format) {
             // Parse the CSV
             auto trim_chars = format.get_trim_chars();
-            RowCollection rows;
 
             StringViewParser parser(head, format);
-            parser.set_output(rows);
-            parser.next();
+            parser.set_max_rows(format.get_header()+1);
+            parser.read_csv();
 
-            return CSVRow(std::move(rows[format.get_header()]));
+            CSVRow row;
+            while (parser._channel.try_dequeue(row)) {}
+            return std::move(row);
         }
 
         CSV_INLINE GuessScore calculate_score(csv::string_view head, CSVFormat format) {
@@ -44,16 +32,14 @@ namespace csv {
             // Map row lengths to row num where they first occurred
             std::unordered_map<size_t, size_t> row_when = { { 0, 0 } };
 
-            RowCollection rows;
-
-            // Parse the CSV
+            // Parse the CSV. We are parsing in the current thread, so once next()
+            // completes, the data in _channel will not update asynchronously.
             StringViewParser parser(head, format);
-            parser.set_output(rows);
-            parser.next();
+            parser.set_max_rows(30);
+            parser.read_csv();
 
-            for (size_t i = 0; i < rows.size(); i++) {
-                auto& row = rows[i];
-
+            CSVRow row;
+            for (int i = 0; parser._channel.try_dequeue(row); ++i) {
                 // Ignore zero-length rows
                 if (row.size() > 0) {
                     if (row_tally.find(row.size()) != row_tally.end()) {
@@ -66,7 +52,7 @@ namespace csv {
                 }
             }
 
-            double final_score = 0;
+            double final_score = 0.0;
             size_t header_row = 0;
 
             // Final score is equal to the largest
@@ -149,23 +135,24 @@ namespace csv {
      *  \snippet tests/test_read_csv.cpp CSVField Example
      *
      */
-	CSV_INLINE CSVReader::CSVReader(csv::string_view filename, CSVFormat format) : _format(format) {
-        auto head = internals::get_csv_head(filename);
-        using Parser = internals::MmapParser;
-
+	CSV_INLINE CSVReader::CSVReader(csv::string_view filename, CSVFormat format) {
         /** Guess delimiter and header row */
         if (format.guess_delim()) {
+            auto head = internals::get_csv_head(filename);
             auto guess_result = internals::_guess_format(head, format.possible_delimiters);
             format.delimiter(guess_result.delim);
             format.header = guess_result.header_row;
-            this->_format = format;
         }
+
+        this->parser = std::unique_ptr<internals::MmapParser>(
+            new internals::MmapParser(filename, format, this->col_names)); // For C++11
+
+        this->_format = format;
 
         if (!format.col_names.empty())
             this->set_col_names(format.col_names);
 
-        this->parser = std::unique_ptr<Parser>(new Parser(filename, format, this->col_names)); // For C++11
-        this->initial_read();
+        launch_worker_thread();
     }
 
     /** Return the format of the original raw CSV */
@@ -201,19 +188,32 @@ namespace csv {
         return CSV_NOT_FOUND;
     }
 
-    CSV_INLINE void CSVReader::trim_header() {
-        if (!this->header_trimmed) {
-            for (int i = 0; i <= this->_format.header && !this->records->empty(); i++) {
-                if (i == this->_format.header && this->col_names->empty()) {
-                    this->set_col_names(this->records->pop_front());
-                }
-                else {
-                    this->records->pop_front();
-                }
-            }
-
-            this->header_trimmed = true;
+    CSV_INLINE bool CSVReader::trim_header() {
+        if (this->header_trimmed)
+        {
+            return true;
         }
+
+        auto policy = this->_format.variable_column_policy;
+        this->_format.variable_column_policy = VariableColumnPolicy::KEEP;
+
+        bool success = true;
+        for (int i = 0; i <= this->_format.header; i++) {
+            CSVRow row;
+            success = this->read_row(row);
+            if (!success)
+                break;
+            if (i == this->_format.header && this->col_names->empty()) {
+                this->set_col_names(row);
+                this->header_trimmed = true;
+            }
+        }
+
+        // The header lines do not count as data rows.
+        _n_data_rows = 0;
+
+        this->_format.variable_column_policy = policy;
+        return success;
     }
 
     /**
@@ -225,83 +225,21 @@ namespace csv {
         this->n_cols = names.size();
     }
 
-    /**
-     * Read a chunk of CSV data.
-     *
-     * @note This method is meant to be run on its own thread. Only one `read_csv()` thread
-     *       should be active at a time.
-     *
-     * @param[in] bytes Number of bytes to read.
-     *
-     * @see CSVReader::read_csv_worker
-     * @see CSVReader::read_row()
-     */
-    CSV_INLINE bool CSVReader::read_csv(size_t bytes) {
-        // Tell read_row() to listen for CSV rows
-        this->records->notify_all();
+    // Will throw an exception if there's an issue with the file, such as it doesn't exist.
+    CSV_INLINE void CSVReader::launch_worker_thread()
+    {
+        this->read_csv_worker = std::thread([this] { this->parser->read_csv(internals::ITERATION_CHUNK_SIZE); });
 
-        this->parser->set_output(*this->records);
-        this->parser->next(bytes);
-
-        if (!this->header_trimmed) {
-            this->trim_header();
+        // TODO - Move this out of the startup path. Maybe to read_row? Careful of recursive call.
+        if (!this->trim_header())
+        {
+            stop_thread_and_join();
+            return;
         }
-
-        // Tell read_row() to stop waiting
-        this->records->kill_all();
-
-        return true;
     }
 
-    /**
-     * Retrieve rows as CSVRow objects, returning true if more rows are available.
-     *
-     * @par Performance Notes
-     *  - Reads chunks of data that are csv::internals::ITERATION_CHUNK_SIZE bytes large at a time
-     *  - For performance details, read the documentation for CSVRow and CSVField.
-     *
-     * @param[out] row The variable where the parsed row will be stored
-     * @see CSVRow, CSVField
-     *
-     * **Example:**
-     * \snippet tests/test_read_csv.cpp CSVField Example
-     *
-     */
-    CSV_INLINE bool CSVReader::read_row(CSVRow &row) {
-        while (true) {
-            if (this->records->empty()) {
-                if (this->records->is_waitable())
-                    // Reading thread is currently active => wait for it to populate records
-                    this->records->wait();
-                else if (this->parser->eof())
-                    // End of file and no more records
-                    return false;
-                else {
-                    // Reading thread is not active => start another one
-                    if (this->read_csv_worker.joinable())
-                        this->read_csv_worker.join();
-
-                    this->read_csv_worker = std::thread(&CSVReader::read_csv, this, internals::ITERATION_CHUNK_SIZE);
-                }
-            }
-            else if (this->records->front().size() != this->n_cols &&
-                this->_format.variable_column_policy != VariableColumnPolicy::KEEP) {
-                auto errored_row = this->records->pop_front();
-
-                if (this->_format.variable_column_policy == VariableColumnPolicy::THROW) {
-                    if (errored_row.size() < this->n_cols)
-                        throw std::runtime_error("Line too short " + internals::format_row(errored_row));
-
-                    throw std::runtime_error("Line too long " + internals::format_row(errored_row));
-                }
-            }
-            else {
-                row = this->records->pop_front();
-                this->_n_rows++;
-                return true;
-            }
-        }
-
-        return false;
+    CSV_INLINE void CSVReader::stop_thread_and_join()
+    {
+        this->parser->stop_thread_and_join(this->read_csv_worker);
     }
 }
