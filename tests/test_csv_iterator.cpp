@@ -14,7 +14,7 @@ TEST_CASE("Test CSVRow Interator", "[test_csv_row_iter]") {
     auto rows = "A,B,C\r\n" // Header row
         "123,234,345\r\n"
         "1,2,3\r\n"
-        "1,2,3"_csv;
+        "7,8,9"_csv;
 
     CSVRow row;
     rows.read_row(row);

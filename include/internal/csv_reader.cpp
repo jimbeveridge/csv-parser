@@ -169,12 +169,13 @@ namespace csv {
     }
 
     /** Return the CSV's column names as a vector of strings. */
-    CSV_INLINE std::vector<std::string> CSVReader::get_col_names() const {
+    CSV_INLINE const std::vector<std::string>& CSVReader::get_col_names() const {
         if (this->col_names) {
             return this->col_names->get_col_names();
         }
 
-        return std::vector<std::string>();
+        static const std::vector<std::string> empty;
+        return empty;
     }
 
     /** Return the index of the column name if found or
@@ -198,20 +199,24 @@ namespace csv {
         this->_format.variable_column_policy = VariableColumnPolicy::KEEP;
 
         bool success = true;
+        CSVRow row;
+
+        // It's legal for the caller to set the header count and also
+        // provide their own col names. In this case we still need to
+        // strip the header row, but don't do anything with the data.
         for (int i = 0; i <= this->_format.header; i++) {
-            CSVRow row;
             success = this->read_row(row);
             if (!success)
                 break;
             if (i == this->_format.header && this->col_names->empty()) {
                 this->set_col_names(row);
-                this->header_trimmed = true;
             }
         }
 
         // The header lines do not count as data rows.
-        _n_data_rows = 0;
+        this->_n_data_rows = 0;
 
+        this->header_trimmed = true;
         this->_format.variable_column_policy = policy;
         return success;
     }

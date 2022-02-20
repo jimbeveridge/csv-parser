@@ -5911,7 +5911,7 @@ namespace csv {
                 set_col_names(names);
             }
 
-            std::vector<std::string> get_col_names() const;
+            const std::vector<std::string>& get_col_names() const;
             void set_col_names(const std::vector<std::string>&);
             int index_of(csv::string_view) const;
 
@@ -6450,12 +6450,12 @@ namespace csv {
     namespace internals {
         class IBasicCSVParser;
 
-        const std::string ERROR_NAN { "Not a number." };
-        const std::string ERROR_OVERFLOW { "Overflow error." };
-        const std::string ERROR_FLOAT_TO_INT {
+        inline const std::string ERROR_NAN { "Not a number." };
+        inline const std::string ERROR_OVERFLOW { "Overflow error." };
+        inline const std::string ERROR_FLOAT_TO_INT {
             "Attempted to convert a floating point value to an integral type." };
 
-        const std::string ERROR_NEG_TO_UNSIGNED{ "Negative numbers cannot be converted to unsigned types." };
+        inline const std::string ERROR_NEG_TO_UNSIGNED{ "Negative numbers cannot be converted to unsigned types." };
     
         std::string json_escape_string(csv::string_view s) noexcept;
 
@@ -6763,14 +6763,14 @@ namespace csv {
         
         /** Construct a CSVRow from a RawCSVDataPtr */
         CSVRow(std::pmr::polymorphic_allocator<csv::internals::RawCSVField>* pa, internals::RawCSVDataPtr _data) : _pa(pa), data(_data) {}
-        CSVRow(std::pmr::polymorphic_allocator<csv::internals::RawCSVField>* pa, internals::RawCSVDataPtr _data, size_t _data_start, size_t _field_bounds)
-            : _pa(pa), data(_data), data_start(_data_start), fields_start(_field_bounds) {}
+        CSVRow(std::pmr::polymorphic_allocator<csv::internals::RawCSVField>* pa, internals::RawCSVDataPtr _data, size_t _data_start)
+            : _pa(pa), data(_data), data_start(_data_start) {}
 
         /** Indicates whether row is empty or not */
-        CONSTEXPR bool empty() const noexcept { return this->size() == 0; }
+        bool empty() const noexcept { return this->fields.empty(); }
 
         /** Return the number of fields in this row */
-        CONSTEXPR size_t size() const noexcept { return row_length; }
+        size_t size() const noexcept { return this->fields.size(); }
 
         /** Sent when the sender thread exits to wake up the receiver.
          *  All rows may or may not have been sent.
@@ -6872,12 +6872,6 @@ namespace csv {
 
         /** Where in RawCSVData.data we start */
         size_t data_start = 0;
-
-        /** Where in the RawCSVDataPtr.fields array we start */
-        size_t fields_start = 0;
-
-        /** How many columns this row spans */
-        size_t row_length = 0;
     };
 
 #ifdef _MSC_VER
@@ -7069,7 +7063,7 @@ namespace csv {
         /** Read the first 500KB of a CSV file */
         CSV_INLINE std::string get_csv_head(csv::string_view filename, size_t file_size);
 
-        constexpr const int UNINITIALIZED_FIELD = -1;
+        constexpr size_t UNINITIALIZED_FIELD = static_cast<size_t>(-1);
     }
 
     namespace internals {
@@ -7147,7 +7141,7 @@ namespace csv {
              *
              *  @returns How many character were read that are part of complete rows
              */
-            size_t parse(bool forceNewline);
+            size_t parse();
 
             /** Create a new RawCSVDataPtr for a new chunk of data */
             void reset_data_ptr();
@@ -7157,18 +7151,19 @@ namespace csv {
 
         protected:
 
-            std::pmr::monotonic_buffer_resource _mbr{ 1'000'000 };
+            std::pmr::monotonic_buffer_resource _mbr{ (1<<20) - 256 };
             std::pmr::polymorphic_allocator<csv::internals::RawCSVField> _pa{ &_mbr };
 
             /** @name Current Parser State */
             ///@{
-            CSVRow current_row;
+            //CSVRow current_row;
+            std::vector<csv::internals::RawCSVField> current_fields;
+
             // TODO - not thread safe!
             RawCSVDataPtr data_ptr;
             ColNamesPtr _col_names;
-            //CSVFieldList* fields = nullptr;
-            int field_start = UNINITIALIZED_FIELD;
-            size_t field_length = 0;
+
+            RawCSVField field_data{ UNINITIALIZED_FIELD, 0 };
             size_t _max_rows = (size_t)~0;    // Read no more than this many lines
 
             /** An array where the (i + 128)th slot gives the ParseFlags for ASCII character i */
@@ -7191,7 +7186,9 @@ namespace csv {
              */
             WhitespaceMap _ws_flags;
             bool quote_escape = false;
-            bool field_has_double_quote = false;
+
+            /** Where this row starts in the data block */
+            size_t _data_start = 0;
 
             /** Where we are in the current data block */
             size_t data_pos = 0;
@@ -7204,7 +7201,7 @@ namespace csv {
             }
 
             size_t& current_row_start() {
-                return this->current_row.data_start;
+                return _data_start;
             }
 
             /** Process a newline during parsing */
@@ -7258,11 +7255,9 @@ namespace csv {
                 // Read data into buffer
                 size_t length = std::min(source_size - stream_pos, this->_iteration_chunk_size);
                 stream_pos = this->data_ptr->CreateStringSource(_source, stream_pos, length);
-                const bool forceNewline = (stream_pos + this->_iteration_chunk_size >= source_size);
 
                 // Parse
-                this->current_row = CSVRow(&_pa, this->data_ptr);
-                size_t completed = this->parse(forceNewline);
+                size_t completed = this->parse();
                 this->stream_pos -= (length - completed);
 
                 if (eof() || stream_pos == source_size || no_chunk()) {
@@ -7477,7 +7472,7 @@ namespace csv {
         /** @name CSV Metadata */
         ///@{
         CSVFormat get_format() const;
-        std::vector<std::string> get_col_names() const;
+        const std::vector<std::string>& get_col_names() const;
         int index_of(csv::string_view col_name) const;
         ///@}
 
@@ -7552,6 +7547,61 @@ namespace csv {
 #include <sstream>
 #include <vector>
 
+#include <iterator>
+
+template <typename T>
+class CountedRange
+{
+public:
+    CountedRange() = default;
+    CountedRange(T end) : m_end(end) {}
+    CountedRange(T begin, T end) : m_begin(begin), m_end(end) {}
+    CountedRange(const CountedRange&) = default;
+    CountedRange(CountedRange&&) = default;
+    CountedRange& operator=(const CountedRange& rhs) { m_begin = rhs.m_begin; m_end = rhs.m_end; return *this; }
+    CountedRange& operator=(CountedRange&& rhs) { m_begin = rhs.m_begin; m_end = rhs.m_end; return *this; }
+
+    struct iterator
+    {
+        using iterator_category = std::forward_iterator_tag;
+        using difference_type = std::ptrdiff_t;
+        using value_type = T;
+        using pointer = const value_type*;
+        using reference = const value_type&;
+
+        iterator() = default;
+        iterator(value_type current) : m_current(current) {}
+        iterator(const iterator&) = default;
+        iterator(iterator&&) = default;
+        iterator& operator=(const iterator& rhs) { m_current = rhs.m_current; return *this; }
+        iterator& operator=(iterator&& rhs) { m_current = rhs.m_current; return *this; }
+
+        reference operator*() const { return m_current; }
+        pointer operator->() { return &m_current; }
+
+        // Prefix increment
+        iterator& operator++() { m_current++; return *this; }
+
+        // Postfix increment
+        iterator operator++(int) { iterator tmp = *this; ++(*this); return tmp; }
+
+        friend bool operator== (const iterator& a, const iterator& b) { return a.m_current == b.m_current; };
+        friend bool operator!= (const iterator& a, const iterator& b) { return a.m_current != b.m_current; };
+
+    private:
+
+        value_type m_current{};
+    };
+
+    iterator begin() const { return iterator(m_begin); }
+    iterator end() const { return iterator(m_end); }
+
+private:
+    const T m_begin{};
+    const T m_end{};
+};
+
+
 namespace csv {
     /** Class for calculating statistics from CSV files and in-memory sources
      *
@@ -7571,7 +7621,7 @@ namespace csv {
         std::vector<FreqCount> get_counts() const;
         std::vector<TypeCount> get_dtypes() const;
 
-        std::vector<std::string> get_col_names() const {
+        const std::vector<std::string>& get_col_names() const {
             return this->reader.get_col_names();
         }
 
@@ -8174,20 +8224,18 @@ namespace csv {
                 && parse_flag(this->data_ptr->data.back()) == ParseFlags::DELIMITER;
 
             // Push field
-            if (this->field_length > 0 || empty_last_field) {
+            if (this->field_data.length > 0 || empty_last_field) {
                 this->push_field();
             }
 
             // Push row
-            if (this->current_row.size() > 0)
+            if (!this->current_fields.empty())
                 this->push_row();
         }
 
         CSV_INLINE void IBasicCSVParser::enqueue_tombstone()
         {
-            this->current_row = CSVRow(&_pa, nullptr);
-            //this->current_row = CSVRow({}, this->data_pos, this->current_row.fields.size());
-            _channel.wait_enqueue(std::move(current_row));
+            _channel.wait_enqueue(std::move(CSVRow(&_pa, nullptr)));
         }
 
         CSV_INLINE void IBasicCSVParser::parse_field() noexcept {
@@ -8198,8 +8246,8 @@ namespace csv {
             while (data_pos < in.size() && ws_flag(in[data_pos]))
                 data_pos++;
 
-            if (field_start == UNINITIALIZED_FIELD)
-                field_start = (int)(data_pos - current_row_start());
+            if (field_data.start == UNINITIALIZED_FIELD)
+                field_data.start = data_pos - current_row_start();
 
             // Optimization: Since NOT_SPECIAL characters tend to occur in contiguous
             // sequences, use the loop below to avoid having to go through the outer
@@ -8207,47 +8255,42 @@ namespace csv {
             while (data_pos < in.size() && compound_parse_flag(in[data_pos]) == ParseFlags::NOT_SPECIAL)
                 data_pos++;
 
-            field_length = data_pos - (field_start + current_row_start());
+            field_data.length = data_pos - (field_data.start + current_row_start());
 
-            // Trim off trailing whitespace, this->field_length constraint matters
+            // Trim off trailing whitespace, this->field_data.length constraint matters
             // when field is entirely whitespace
-            for (size_t j = data_pos - 1; ws_flag(in[j]) && this->field_length > 0; j--)
-                this->field_length--;
+            for (size_t j = data_pos - 1; ws_flag(in[j]) && this->field_data.length > 0; j--)
+                this->field_data.length--;
         }
 
         CSV_INLINE void IBasicCSVParser::push_field()
         {
-            current_row.fields.emplace_back(
-                field_start == UNINITIALIZED_FIELD ? 0 : (unsigned int)field_start,
-                field_length,
-                field_has_double_quote
-            );
+            if (field_data.start == UNINITIALIZED_FIELD) {
+                field_data.start = 0;
+            }
+            current_fields.emplace_back(field_data);
 
             // Reset field state
-            field_has_double_quote = false;
-            field_length = 0;
-            field_start = UNINITIALIZED_FIELD;
-
-            current_row.row_length++;
+            field_data = RawCSVField{ UNINITIALIZED_FIELD , 0 };
         }
 
         CSV_INLINE void IBasicCSVParser::processNewline()
         {
             // End of record -> Write record
             this->push_field();
-            auto size = std::max(!this->_col_names ? 0 : this->_col_names->size(), this->current_row.fields.size());
             this->push_row();
 
             // Reset
-            this->current_row = CSVRow(&this->_pa, data_ptr, this->data_pos, current_row.fields.size());
-            this->current_row.fields.reserve(size);
+            this->current_fields.clear();
+            this->_data_start = this->data_pos;
         }
 
         /** @return The number of characters parsed that belong to complete rows */
-        CSV_INLINE size_t IBasicCSVParser::parse(bool forceNewline)
+        CSV_INLINE size_t IBasicCSVParser::parse()
         {
             using internals::ParseFlags;
 
+            this->current_fields.clear();
             this->quote_escape = false;
             this->data_pos = 0;
             this->current_row_start() = 0;
@@ -8301,45 +8344,46 @@ namespace csv {
                         else if (next_ch == ParseFlags::QUOTE) {
                             // Case: Escaped quote
                             data_pos += 2;
-                            this->field_length += 2;
-                            this->field_has_double_quote = true;
+                            this->field_data.length += 2;
+                            this->field_data.has_double_quote = true;
                             break;
                         }
                     }
                     
                     // Case: Unescaped single quote => not strictly valid but we'll keep it
-                    this->field_length++;
+                    this->field_data.length++;
                     data_pos++;
 
                     break;
 
                 default: // Quote (currently not quote escaped)
-                    if (this->field_length == 0) {
+                    if (this->field_data.length == 0) {
                         quote_escape = true;
                         data_pos++;
-                        if (field_start == UNINITIALIZED_FIELD && data_pos < in.size() && !ws_flag(in[data_pos]))
-                            field_start = (int)(data_pos - current_row_start());
+                        if (field_data.start == UNINITIALIZED_FIELD && data_pos < in.size() && !ws_flag(in[data_pos]))
+                            field_data.start = (int)(data_pos - current_row_start());
                         break;
                     }
 
                     // Case: Unescaped quote
-                    this->field_length++;
+                    this->field_data.length++;
                     data_pos++;
 
                     break;
                 }
             }
 
-            if (forceNewline && this->data_pos > 0 && compound_parse_flag(in[this->data_pos-1]) != ParseFlags::NEWLINE) {
-                processNewline();
-            }
-
             return this->current_row_start();
         }
 
         CSV_INLINE void IBasicCSVParser::push_row() {
-            current_row.row_length = current_row.fields.size() - current_row.fields_start;
-            _channel.wait_enqueue(std::move(current_row));
+
+            CSVRow row(&this->_pa, data_ptr, this->_data_start);
+
+            std::pmr::vector<csv::internals::RawCSVField> raw_fields{ this->current_fields.begin(), this->current_fields.end() };
+            row.fields = std::move(raw_fields);
+
+            _channel.wait_enqueue(std::move(row));
             if (_max_rows > 0) {
                 --_max_rows;
             }
@@ -8349,7 +8393,6 @@ namespace csv {
             this->data_ptr = std::make_shared<RawCSVData>();
             this->data_ptr->parse_flags = this->_parse_flags;
             this->data_ptr->col_names = this->_col_names;
-            //this->current_row.fields = &(this->data_ptr->fields);
         }
 
         CSV_INLINE void IBasicCSVParser::trim_utf8_bom() {
@@ -8389,9 +8432,7 @@ namespace csv {
             stream_pos = this->data_ptr->CreateStringViewSource(_source, stream_pos, length);
 
             // Parse
-            this->current_row = CSVRow(&_pa, this->data_ptr);
-            bool forceNewline = (stream_pos + this->_iteration_chunk_size >= source_size);
-            size_t completed = this->parse(forceNewline);
+            size_t completed = this->parse();
             this->stream_pos -= (length - completed);
 
             if (eof() || stream_pos == source_size || no_chunk()) {
@@ -8402,20 +8443,17 @@ namespace csv {
 
         CSV_INLINE void MmapParser::next() {
             // Reset parser state
-            this->field_start = UNINITIALIZED_FIELD;
-            this->field_length = 0;
+            this->field_data.start = UNINITIALIZED_FIELD;
+            this->field_data.length = 0;
             this->reset_data_ptr();
 
             size_t length = std::min(this->source_size - this->mmap_pos, this->_iteration_chunk_size);
-            const bool forceNewline = length < this->_iteration_chunk_size;
             if (length > 0) {
                 // Create memory map
                 this->mmap_pos = this->data_ptr->CreateMmapSource(this->_filename, this->mmap_pos, length);
 
                 // Parse
-                this->current_row = CSVRow(&_pa, this->data_ptr);
-                // If we are at the end of the file, parse the last line even if there's no newline
-                size_t completed = this->parse(forceNewline);
+                size_t completed = this->parse();
                 this->mmap_pos -= (length - completed);
             }
 
@@ -8433,7 +8471,7 @@ namespace csv {
 
 namespace csv {
     namespace internals {
-        CSV_INLINE std::vector<std::string> ColNames::get_col_names() const {
+        CSV_INLINE const std::vector<std::string>& ColNames::get_col_names() const {
             return this->col_names;
         }
 
@@ -8720,12 +8758,13 @@ namespace csv {
     }
 
     /** Return the CSV's column names as a vector of strings. */
-    CSV_INLINE std::vector<std::string> CSVReader::get_col_names() const {
+    CSV_INLINE const std::vector<std::string>& CSVReader::get_col_names() const {
         if (this->col_names) {
             return this->col_names->get_col_names();
         }
 
-        return std::vector<std::string>();
+        static const std::vector<std::string> empty;
+        return empty;
     }
 
     /** Return the index of the column name if found or
@@ -8749,20 +8788,24 @@ namespace csv {
         this->_format.variable_column_policy = VariableColumnPolicy::KEEP;
 
         bool success = true;
+        CSVRow row;
+
+        // It's legal for the caller to set the header count and also
+        // provide their own col names. In this case we still need to
+        // strip the header row, but don't do anything with the data.
         for (int i = 0; i <= this->_format.header; i++) {
-            CSVRow row;
             success = this->read_row(row);
             if (!success)
                 break;
             if (i == this->_format.header && this->col_names->empty()) {
                 this->set_col_names(row);
-                this->header_trimmed = true;
             }
         }
 
         // The header lines do not count as data rows.
-        _n_data_rows = 0;
+        this->_n_data_rows = 0;
 
+        this->header_trimmed = true;
         this->_format.variable_column_policy = policy;
         return success;
     }
@@ -8975,15 +9018,14 @@ namespace csv {
         if (index >= this->size())
             throw std::runtime_error("Index out of bounds.");
 
-        const size_t field_index = this->fields_start + index;
-        auto& field = this->fields[field_index];
+        auto& field = this->fields[index];
         auto field_str = csv::string_view(this->data->data).substr(this->data_start + field.start);
 
         if (field.has_double_quote) {
             if (double_quote_fields == nullptr) {
                 double_quote_fields.reset(new std::unordered_map<size_t, std::string>);
             }
-            auto& value = (*this->double_quote_fields)[field_index];
+            auto& value = (*this->double_quote_fields)[index];
             if (value.empty()) {
                 bool prev_ch_quote = false;
                 for (size_t i = 0; i < field.length; i++) {
@@ -9433,8 +9475,15 @@ namespace csv {
  */
 
 #include <string>
+#include <execution>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
 namespace csv {
+
+    constexpr size_t CALC_CHUNK_SIZE = 5000;
+
     /** Calculate statistics for an arbitrarily large file. When this constructor
      *  is called, CSVStat will process the entire file iteratively. Once finished,
      *  methods like get_mean(), get_counts(), etc... can be used to retrieve statistics.
@@ -9452,16 +9501,13 @@ namespace csv {
 
     /** Return current means */
     CSV_INLINE std::vector<long double> CSVStat::get_mean() const {
-        std::vector<long double> ret;        
-        for (size_t i = 0; i < this->get_col_names().size(); i++) {
-            ret.push_back(this->rolling_means[i]);
-        }
-        return ret;
+        return this->rolling_means;
     }
 
     /** Return current variances */
     CSV_INLINE std::vector<long double> CSVStat::get_variance() const {
         std::vector<long double> ret;        
+        ret.reserve(this->get_col_names().size());
         for (size_t i = 0; i < this->get_col_names().size(); i++) {
             ret.push_back(this->rolling_vars[i]/(this->n[i] - 1));
         }
@@ -9470,71 +9516,53 @@ namespace csv {
 
     /** Return current mins */
     CSV_INLINE std::vector<long double> CSVStat::get_mins() const {
-        std::vector<long double> ret;        
-        for (size_t i = 0; i < this->get_col_names().size(); i++) {
-            ret.push_back(this->mins[i]);
-        }
-        return ret;
+        return this->mins;
     }
 
     /** Return current maxes */
     CSV_INLINE std::vector<long double> CSVStat::get_maxes() const {
-        std::vector<long double> ret;        
-        for (size_t i = 0; i < this->get_col_names().size(); i++) {
-            ret.push_back(this->maxes[i]);
-        }
-        return ret;
+        return this->maxes;
     }
 
     /** Get counts for each column */
     CSV_INLINE std::vector<CSVStat::FreqCount> CSVStat::get_counts() const {
-        std::vector<FreqCount> ret;
-        for (size_t i = 0; i < this->get_col_names().size(); i++) {
-            ret.push_back(this->counts[i]);
-        }
-        return ret;
+        return this->counts;
     }
 
     /** Get data type counts for each column */
     CSV_INLINE std::vector<CSVStat::TypeCount> CSVStat::get_dtypes() const {
-        std::vector<TypeCount> ret;        
-        for (size_t i = 0; i < this->get_col_names().size(); i++) {
-            ret.push_back(this->dtypes[i]);
-        }
-        return ret;
+        return this->dtypes;
     }
 
     CSV_INLINE void CSVStat::calc_chunk() {
-        /** Only create stats counters the first time **/
-        if (dtypes.empty()) {
-            /** Go through all records and calculate specified statistics */
-            for (size_t i = 0; i < this->get_col_names().size(); i++) {
-                dtypes.push_back({});
-                counts.push_back({});
-                rolling_means.push_back(0);
-                rolling_vars.push_back(0);
-                mins.push_back(NAN);
-                maxes.push_back(NAN);
-                n.push_back(0);
-            }
+        const size_t count = this->get_col_names().size();
+
+        // Threads take time to start. Don't be too eager to do so.
+        CountedRange counter(count);
+        if (count > 100) {
+            std::for_each(std::execution::par_unseq, counter.begin(), counter.end(),
+                [this](size_t i) { calc_worker(i); });
         }
-
-        // Start threads
-        std::vector<std::thread> pool;
-        for (size_t i = 0; i < this->get_col_names().size(); i++)
-            pool.push_back(std::thread(&CSVStat::calc_worker, this, i));
-
-        // Block until done
-        for (auto& th : pool)
-            th.join();
+        else {
+            std::for_each(std::execution::seq, counter.begin(), counter.end(),
+                [this](size_t i) { calc_worker(i); });
+        }
 
         this->records.clear();
     }
 
     CSV_INLINE void CSVStat::calc() {
-        constexpr size_t CALC_CHUNK_SIZE = 5000;
+        const size_t count = this->get_col_names().size();
 
-        for (auto& row : reader) {
+        dtypes.resize(count);
+        counts.resize(count);
+        rolling_means.resize(count);
+        rolling_vars.resize(count);
+        mins.resize(count, NAN);
+        maxes.resize(count, NAN);
+        n.resize(count);
+
+        for (const auto& row : reader) {
             this->records.push_back(std::move(row));
 
             /** Chunk rows */
@@ -9590,14 +9618,7 @@ namespace csv {
          */
         
         auto type = data.type();
-        if (this->dtypes[i].find(type) !=
-            this->dtypes[i].end()) {
-            // Increment count
-            this->dtypes[i][type]++;
-        } else {
-            // Initialize count
-            this->dtypes[i].insert(std::make_pair(type, 1));
-        }
+        this->dtypes[i][type]++;
     }
 
     CSV_INLINE void CSVStat::count(CSVField& data, const size_t &i) {
@@ -9607,15 +9628,7 @@ namespace csv {
          */
 
         auto item = data.get<std::string>();
-
-        if (this->counts[i].find(item) !=
-            this->counts[i].end()) {
-            // Increment count
-            this->counts[i][item]++;
-        } else {
-            // Initialize count
-            this->counts[i].insert(std::make_pair(item, 1));
-        }
+        this->counts[i][item]++;
     }
 
     CSV_INLINE void CSVStat::min_max(const long double &x_n, const size_t &i) {
@@ -9670,10 +9683,11 @@ namespace csv {
         CSVStat stat(filename);
         std::unordered_map<std::string, DataType> csv_dtypes;
 
-        auto col_names = stat.get_col_names();
+        auto& col_names = stat.get_col_names();
+        const size_t count = col_names.size();
         auto temp = stat.get_dtypes();
 
-        for (size_t i = 0; i < stat.get_col_names().size(); i++) {
+        for (size_t i = 0; i < count; i++) {
             auto& col = temp[i];
             auto& col_name = col_names[i];
 

@@ -21,12 +21,12 @@ namespace csv {
     namespace internals {
         class IBasicCSVParser;
 
-        const std::string ERROR_NAN { "Not a number." };
-        const std::string ERROR_OVERFLOW { "Overflow error." };
-        const std::string ERROR_FLOAT_TO_INT {
+        inline const std::string ERROR_NAN { "Not a number." };
+        inline const std::string ERROR_OVERFLOW { "Overflow error." };
+        inline const std::string ERROR_FLOAT_TO_INT {
             "Attempted to convert a floating point value to an integral type." };
 
-        const std::string ERROR_NEG_TO_UNSIGNED{ "Negative numbers cannot be converted to unsigned types." };
+        inline const std::string ERROR_NEG_TO_UNSIGNED{ "Negative numbers cannot be converted to unsigned types." };
     
         std::string json_escape_string(csv::string_view s) noexcept;
 
@@ -334,14 +334,14 @@ namespace csv {
         
         /** Construct a CSVRow from a RawCSVDataPtr */
         CSVRow(std::pmr::polymorphic_allocator<csv::internals::RawCSVField>* pa, internals::RawCSVDataPtr _data) : _pa(pa), data(_data) {}
-        CSVRow(std::pmr::polymorphic_allocator<csv::internals::RawCSVField>* pa, internals::RawCSVDataPtr _data, size_t _data_start, size_t _field_bounds)
-            : _pa(pa), data(_data), data_start(_data_start), fields_start(_field_bounds) {}
+        CSVRow(std::pmr::polymorphic_allocator<csv::internals::RawCSVField>* pa, internals::RawCSVDataPtr _data, size_t _data_start)
+            : _pa(pa), data(_data), data_start(_data_start) {}
 
         /** Indicates whether row is empty or not */
-        CONSTEXPR bool empty() const noexcept { return this->size() == 0; }
+        bool empty() const noexcept { return this->fields.empty(); }
 
         /** Return the number of fields in this row */
-        CONSTEXPR size_t size() const noexcept { return row_length; }
+        size_t size() const noexcept { return this->fields.size(); }
 
         /** Sent when the sender thread exits to wake up the receiver.
          *  All rows may or may not have been sent.
@@ -443,12 +443,6 @@ namespace csv {
 
         /** Where in RawCSVData.data we start */
         size_t data_start = 0;
-
-        /** Where in the RawCSVDataPtr.fields array we start */
-        size_t fields_start = 0;
-
-        /** How many columns this row spans */
-        size_t row_length = 0;
     };
 
 #ifdef _MSC_VER

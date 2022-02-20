@@ -157,7 +157,7 @@ namespace csv {
         /** Read the first 500KB of a CSV file */
         CSV_INLINE std::string get_csv_head(csv::string_view filename, size_t file_size);
 
-        constexpr const int UNINITIALIZED_FIELD = -1;
+        constexpr size_t UNINITIALIZED_FIELD = static_cast<size_t>(-1);
     }
 
     namespace internals {
@@ -235,7 +235,7 @@ namespace csv {
              *
              *  @returns How many character were read that are part of complete rows
              */
-            size_t parse(bool forceNewline);
+            size_t parse();
 
             /** Create a new RawCSVDataPtr for a new chunk of data */
             void reset_data_ptr();
@@ -245,18 +245,19 @@ namespace csv {
 
         protected:
 
-            std::pmr::monotonic_buffer_resource _mbr{ 1'000'000 };
+            std::pmr::monotonic_buffer_resource _mbr{ (1<<20) - 256 };
             std::pmr::polymorphic_allocator<csv::internals::RawCSVField> _pa{ &_mbr };
 
             /** @name Current Parser State */
             ///@{
-            CSVRow current_row;
+            //CSVRow current_row;
+            std::vector<csv::internals::RawCSVField> current_fields;
+
             // TODO - not thread safe!
             RawCSVDataPtr data_ptr;
             ColNamesPtr _col_names;
-            //CSVFieldList* fields = nullptr;
-            int field_start = UNINITIALIZED_FIELD;
-            size_t field_length = 0;
+
+            RawCSVField field_data{ UNINITIALIZED_FIELD, 0 };
             size_t _max_rows = (size_t)~0;    // Read no more than this many lines
 
             /** An array where the (i + 128)th slot gives the ParseFlags for ASCII character i */
@@ -279,7 +280,9 @@ namespace csv {
              */
             WhitespaceMap _ws_flags;
             bool quote_escape = false;
-            bool field_has_double_quote = false;
+
+            /** Where this row starts in the data block */
+            size_t _data_start = 0;
 
             /** Where we are in the current data block */
             size_t data_pos = 0;
@@ -292,7 +295,7 @@ namespace csv {
             }
 
             size_t& current_row_start() {
-                return this->current_row.data_start;
+                return _data_start;
             }
 
             /** Process a newline during parsing */
@@ -346,11 +349,9 @@ namespace csv {
                 // Read data into buffer
                 size_t length = std::min(source_size - stream_pos, this->_iteration_chunk_size);
                 stream_pos = this->data_ptr->CreateStringSource(_source, stream_pos, length);
-                const bool forceNewline = (stream_pos + this->_iteration_chunk_size >= source_size);
 
                 // Parse
-                this->current_row = CSVRow(&_pa, this->data_ptr);
-                size_t completed = this->parse(forceNewline);
+                size_t completed = this->parse();
                 this->stream_pos -= (length - completed);
 
                 if (eof() || stream_pos == source_size || no_chunk()) {

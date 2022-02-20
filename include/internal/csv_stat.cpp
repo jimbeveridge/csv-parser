@@ -3,9 +3,16 @@
  */
 
 #include <string>
+#include <execution>
+#include <string>
+#include <unordered_map>
+#include <vector>
 #include "csv_stat.hpp"
 
 namespace csv {
+
+    constexpr size_t CALC_CHUNK_SIZE = 5000;
+
     /** Calculate statistics for an arbitrarily large file. When this constructor
      *  is called, CSVStat will process the entire file iteratively. Once finished,
      *  methods like get_mean(), get_counts(), etc... can be used to retrieve statistics.
@@ -23,16 +30,13 @@ namespace csv {
 
     /** Return current means */
     CSV_INLINE std::vector<long double> CSVStat::get_mean() const {
-        std::vector<long double> ret;        
-        for (size_t i = 0; i < this->get_col_names().size(); i++) {
-            ret.push_back(this->rolling_means[i]);
-        }
-        return ret;
+        return this->rolling_means;
     }
 
     /** Return current variances */
     CSV_INLINE std::vector<long double> CSVStat::get_variance() const {
         std::vector<long double> ret;        
+        ret.reserve(this->get_col_names().size());
         for (size_t i = 0; i < this->get_col_names().size(); i++) {
             ret.push_back(this->rolling_vars[i]/(this->n[i] - 1));
         }
@@ -41,71 +45,53 @@ namespace csv {
 
     /** Return current mins */
     CSV_INLINE std::vector<long double> CSVStat::get_mins() const {
-        std::vector<long double> ret;        
-        for (size_t i = 0; i < this->get_col_names().size(); i++) {
-            ret.push_back(this->mins[i]);
-        }
-        return ret;
+        return this->mins;
     }
 
     /** Return current maxes */
     CSV_INLINE std::vector<long double> CSVStat::get_maxes() const {
-        std::vector<long double> ret;        
-        for (size_t i = 0; i < this->get_col_names().size(); i++) {
-            ret.push_back(this->maxes[i]);
-        }
-        return ret;
+        return this->maxes;
     }
 
     /** Get counts for each column */
     CSV_INLINE std::vector<CSVStat::FreqCount> CSVStat::get_counts() const {
-        std::vector<FreqCount> ret;
-        for (size_t i = 0; i < this->get_col_names().size(); i++) {
-            ret.push_back(this->counts[i]);
-        }
-        return ret;
+        return this->counts;
     }
 
     /** Get data type counts for each column */
     CSV_INLINE std::vector<CSVStat::TypeCount> CSVStat::get_dtypes() const {
-        std::vector<TypeCount> ret;        
-        for (size_t i = 0; i < this->get_col_names().size(); i++) {
-            ret.push_back(this->dtypes[i]);
-        }
-        return ret;
+        return this->dtypes;
     }
 
     CSV_INLINE void CSVStat::calc_chunk() {
-        /** Only create stats counters the first time **/
-        if (dtypes.empty()) {
-            /** Go through all records and calculate specified statistics */
-            for (size_t i = 0; i < this->get_col_names().size(); i++) {
-                dtypes.push_back({});
-                counts.push_back({});
-                rolling_means.push_back(0);
-                rolling_vars.push_back(0);
-                mins.push_back(NAN);
-                maxes.push_back(NAN);
-                n.push_back(0);
-            }
+        const size_t count = this->get_col_names().size();
+
+        // Threads take time to start. Don't be too eager to do so.
+        CountedRange counter(count);
+        if (count > 100) {
+            std::for_each(std::execution::par_unseq, counter.begin(), counter.end(),
+                [this](size_t i) { calc_worker(i); });
         }
-
-        // Start threads
-        std::vector<std::thread> pool;
-        for (size_t i = 0; i < this->get_col_names().size(); i++)
-            pool.push_back(std::thread(&CSVStat::calc_worker, this, i));
-
-        // Block until done
-        for (auto& th : pool)
-            th.join();
+        else {
+            std::for_each(std::execution::seq, counter.begin(), counter.end(),
+                [this](size_t i) { calc_worker(i); });
+        }
 
         this->records.clear();
     }
 
     CSV_INLINE void CSVStat::calc() {
-        constexpr size_t CALC_CHUNK_SIZE = 5000;
+        const size_t count = this->get_col_names().size();
 
-        for (auto& row : reader) {
+        dtypes.resize(count);
+        counts.resize(count);
+        rolling_means.resize(count);
+        rolling_vars.resize(count);
+        mins.resize(count, NAN);
+        maxes.resize(count, NAN);
+        n.resize(count);
+
+        for (const auto& row : reader) {
             this->records.push_back(std::move(row));
 
             /** Chunk rows */
@@ -161,14 +147,7 @@ namespace csv {
          */
         
         auto type = data.type();
-        if (this->dtypes[i].find(type) !=
-            this->dtypes[i].end()) {
-            // Increment count
-            this->dtypes[i][type]++;
-        } else {
-            // Initialize count
-            this->dtypes[i].insert(std::make_pair(type, 1));
-        }
+        this->dtypes[i][type]++;
     }
 
     CSV_INLINE void CSVStat::count(CSVField& data, const size_t &i) {
@@ -178,15 +157,7 @@ namespace csv {
          */
 
         auto item = data.get<std::string>();
-
-        if (this->counts[i].find(item) !=
-            this->counts[i].end()) {
-            // Increment count
-            this->counts[i][item]++;
-        } else {
-            // Initialize count
-            this->counts[i].insert(std::make_pair(item, 1));
-        }
+        this->counts[i][item]++;
     }
 
     CSV_INLINE void CSVStat::min_max(const long double &x_n, const size_t &i) {
@@ -241,10 +212,11 @@ namespace csv {
         CSVStat stat(filename);
         std::unordered_map<std::string, DataType> csv_dtypes;
 
-        auto col_names = stat.get_col_names();
+        auto& col_names = stat.get_col_names();
+        const size_t count = col_names.size();
         auto temp = stat.get_dtypes();
 
-        for (size_t i = 0; i < stat.get_col_names().size(); i++) {
+        for (size_t i = 0; i < count; i++) {
             auto& col = temp[i];
             auto& col_name = col_names[i];
 

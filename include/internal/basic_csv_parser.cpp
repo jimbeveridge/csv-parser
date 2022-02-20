@@ -162,20 +162,18 @@ namespace csv {
                 && parse_flag(this->data_ptr->data.back()) == ParseFlags::DELIMITER;
 
             // Push field
-            if (this->field_length > 0 || empty_last_field) {
+            if (this->field_data.length > 0 || empty_last_field) {
                 this->push_field();
             }
 
             // Push row
-            if (this->current_row.size() > 0)
+            if (!this->current_fields.empty())
                 this->push_row();
         }
 
         CSV_INLINE void IBasicCSVParser::enqueue_tombstone()
         {
-            this->current_row = CSVRow(&_pa, nullptr);
-            //this->current_row = CSVRow({}, this->data_pos, this->current_row.fields.size());
-            _channel.wait_enqueue(std::move(current_row));
+            _channel.wait_enqueue(std::move(CSVRow(&_pa, nullptr)));
         }
 
         CSV_INLINE void IBasicCSVParser::parse_field() noexcept {
@@ -186,8 +184,8 @@ namespace csv {
             while (data_pos < in.size() && ws_flag(in[data_pos]))
                 data_pos++;
 
-            if (field_start == UNINITIALIZED_FIELD)
-                field_start = (int)(data_pos - current_row_start());
+            if (field_data.start == UNINITIALIZED_FIELD)
+                field_data.start = data_pos - current_row_start();
 
             // Optimization: Since NOT_SPECIAL characters tend to occur in contiguous
             // sequences, use the loop below to avoid having to go through the outer
@@ -195,47 +193,42 @@ namespace csv {
             while (data_pos < in.size() && compound_parse_flag(in[data_pos]) == ParseFlags::NOT_SPECIAL)
                 data_pos++;
 
-            field_length = data_pos - (field_start + current_row_start());
+            field_data.length = data_pos - (field_data.start + current_row_start());
 
-            // Trim off trailing whitespace, this->field_length constraint matters
+            // Trim off trailing whitespace, this->field_data.length constraint matters
             // when field is entirely whitespace
-            for (size_t j = data_pos - 1; ws_flag(in[j]) && this->field_length > 0; j--)
-                this->field_length--;
+            for (size_t j = data_pos - 1; ws_flag(in[j]) && this->field_data.length > 0; j--)
+                this->field_data.length--;
         }
 
         CSV_INLINE void IBasicCSVParser::push_field()
         {
-            current_row.fields.emplace_back(
-                field_start == UNINITIALIZED_FIELD ? 0 : (unsigned int)field_start,
-                field_length,
-                field_has_double_quote
-            );
+            if (field_data.start == UNINITIALIZED_FIELD) {
+                field_data.start = 0;
+            }
+            current_fields.emplace_back(field_data);
 
             // Reset field state
-            field_has_double_quote = false;
-            field_length = 0;
-            field_start = UNINITIALIZED_FIELD;
-
-            current_row.row_length++;
+            field_data = RawCSVField{ UNINITIALIZED_FIELD , 0 };
         }
 
         CSV_INLINE void IBasicCSVParser::processNewline()
         {
             // End of record -> Write record
             this->push_field();
-            auto size = std::max(!this->_col_names ? 0 : this->_col_names->size(), this->current_row.fields.size());
             this->push_row();
 
             // Reset
-            this->current_row = CSVRow(&this->_pa, data_ptr, this->data_pos, current_row.fields.size());
-            this->current_row.fields.reserve(size);
+            this->current_fields.clear();
+            this->_data_start = this->data_pos;
         }
 
         /** @return The number of characters parsed that belong to complete rows */
-        CSV_INLINE size_t IBasicCSVParser::parse(bool forceNewline)
+        CSV_INLINE size_t IBasicCSVParser::parse()
         {
             using internals::ParseFlags;
 
+            this->current_fields.clear();
             this->quote_escape = false;
             this->data_pos = 0;
             this->current_row_start() = 0;
@@ -289,45 +282,46 @@ namespace csv {
                         else if (next_ch == ParseFlags::QUOTE) {
                             // Case: Escaped quote
                             data_pos += 2;
-                            this->field_length += 2;
-                            this->field_has_double_quote = true;
+                            this->field_data.length += 2;
+                            this->field_data.has_double_quote = true;
                             break;
                         }
                     }
                     
                     // Case: Unescaped single quote => not strictly valid but we'll keep it
-                    this->field_length++;
+                    this->field_data.length++;
                     data_pos++;
 
                     break;
 
                 default: // Quote (currently not quote escaped)
-                    if (this->field_length == 0) {
+                    if (this->field_data.length == 0) {
                         quote_escape = true;
                         data_pos++;
-                        if (field_start == UNINITIALIZED_FIELD && data_pos < in.size() && !ws_flag(in[data_pos]))
-                            field_start = (int)(data_pos - current_row_start());
+                        if (field_data.start == UNINITIALIZED_FIELD && data_pos < in.size() && !ws_flag(in[data_pos]))
+                            field_data.start = (int)(data_pos - current_row_start());
                         break;
                     }
 
                     // Case: Unescaped quote
-                    this->field_length++;
+                    this->field_data.length++;
                     data_pos++;
 
                     break;
                 }
             }
 
-            if (forceNewline && this->data_pos > 0 && compound_parse_flag(in[this->data_pos-1]) != ParseFlags::NEWLINE) {
-                processNewline();
-            }
-
             return this->current_row_start();
         }
 
         CSV_INLINE void IBasicCSVParser::push_row() {
-            current_row.row_length = current_row.fields.size() - current_row.fields_start;
-            _channel.wait_enqueue(std::move(current_row));
+
+            CSVRow row(&this->_pa, data_ptr, this->_data_start);
+
+            std::pmr::vector<csv::internals::RawCSVField> raw_fields{ this->current_fields.begin(), this->current_fields.end() };
+            row.fields = std::move(raw_fields);
+
+            _channel.wait_enqueue(std::move(row));
             if (_max_rows > 0) {
                 --_max_rows;
             }
@@ -337,7 +331,6 @@ namespace csv {
             this->data_ptr = std::make_shared<RawCSVData>();
             this->data_ptr->parse_flags = this->_parse_flags;
             this->data_ptr->col_names = this->_col_names;
-            //this->current_row.fields = &(this->data_ptr->fields);
         }
 
         CSV_INLINE void IBasicCSVParser::trim_utf8_bom() {
@@ -377,9 +370,7 @@ namespace csv {
             stream_pos = this->data_ptr->CreateStringViewSource(_source, stream_pos, length);
 
             // Parse
-            this->current_row = CSVRow(&_pa, this->data_ptr);
-            bool forceNewline = (stream_pos + this->_iteration_chunk_size >= source_size);
-            size_t completed = this->parse(forceNewline);
+            size_t completed = this->parse();
             this->stream_pos -= (length - completed);
 
             if (eof() || stream_pos == source_size || no_chunk()) {
@@ -390,20 +381,17 @@ namespace csv {
 
         CSV_INLINE void MmapParser::next() {
             // Reset parser state
-            this->field_start = UNINITIALIZED_FIELD;
-            this->field_length = 0;
+            this->field_data.start = UNINITIALIZED_FIELD;
+            this->field_data.length = 0;
             this->reset_data_ptr();
 
             size_t length = std::min(this->source_size - this->mmap_pos, this->_iteration_chunk_size);
-            const bool forceNewline = length < this->_iteration_chunk_size;
             if (length > 0) {
                 // Create memory map
                 this->mmap_pos = this->data_ptr->CreateMmapSource(this->_filename, this->mmap_pos, length);
 
                 // Parse
-                this->current_row = CSVRow(&_pa, this->data_ptr);
-                // If we are at the end of the file, parse the last line even if there's no newline
-                size_t completed = this->parse(forceNewline);
+                size_t completed = this->parse();
                 this->mmap_pos -= (length - completed);
             }
 

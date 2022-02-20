@@ -2,7 +2,7 @@
 
 namespace csv {
     namespace internals {
-        CSV_INLINE std::vector<std::string> ColNames::get_col_names() const {
+        CSV_INLINE const std::vector<std::string>& ColNames::get_col_names() const {
             return this->col_names;
         }
 

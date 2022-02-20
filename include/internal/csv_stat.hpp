@@ -6,6 +6,7 @@
 #include <unordered_map>
 #include <sstream>
 #include <vector>
+#include "counted_range.hpp"
 #include "csv_reader.hpp"
 
 namespace csv {
@@ -27,7 +28,7 @@ namespace csv {
         std::vector<FreqCount> get_counts() const;
         std::vector<TypeCount> get_dtypes() const;
 
-        std::vector<std::string> get_col_names() const {
+        const std::vector<std::string>& get_col_names() const {
             return this->reader.get_col_names();
         }
 

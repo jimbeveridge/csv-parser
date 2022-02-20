@@ -25,7 +25,7 @@ namespace csv {
                 set_col_names(names);
             }
 
-            std::vector<std::string> get_col_names() const;
+            const std::vector<std::string>& get_col_names() const;
             void set_col_names(const std::vector<std::string>&);
             int index_of(csv::string_view) const;
 

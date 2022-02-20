@@ -11,23 +11,26 @@ using namespace csv;
 
 TEST_CASE("Simple Buffered Integer Round Trip Test", "[test_roundtrip_int]") {
     auto filename = "round_trip.csv";
-    std::ofstream outfile(filename, std::ios::binary);
-    auto writer = make_csv_writer_buffered(outfile);
+    constexpr size_t n_rows = 1'000'000;
 
-    writer << std::vector<std::string>({"A", "B", "C", "D", "E"});
+    if constexpr (true)
+    {
+        std::ofstream outfile(filename, std::ios::binary);
+        auto writer = make_csv_writer_buffered(outfile);
 
-    const size_t n_rows = 1000000;
+        writer << std::vector<std::string>({ "A", "B", "C", "D", "E" });
 
-    for (size_t i = 0; i < n_rows; i++) {
-        auto str = internals::to_string(i);
-        writer << std::array<csv::string_view, 5>({str, str, str, str, str});
+        for (size_t i = 0; i < n_rows; i++) {
+            auto str = internals::to_string(i);
+            writer << std::array<csv::string_view, 5>({ str, str, str, str, str });
+        }
+        writer.flush();
     }
-    writer.flush();
 
     CSVReader reader(filename);
 
     size_t i = 0;
-    for (auto &row : reader) {
+    for (auto& row : reader) {
         for (auto &col : row) {
             REQUIRE(col == i);
         }
@@ -40,6 +43,7 @@ TEST_CASE("Simple Buffered Integer Round Trip Test", "[test_roundtrip_int]") {
     remove(filename);
 }
 
+
 TEST_CASE("Simple Integer Round Trip Test", "[test_roundtrip_int]") {
     auto filename = "round_trip.csv";
     std::ofstream outfile(filename, std::ios::binary);
@@ -47,9 +51,9 @@ TEST_CASE("Simple Integer Round Trip Test", "[test_roundtrip_int]") {
 
     writer << std::vector<std::string>({ "A", "B", "C", "D", "E" });
 
-    const size_t n_rows = 1000000;
+    constexpr size_t n_rows = 1'000'000;
 
-    for (size_t i = 0; i <= n_rows; i++) {
+    for (size_t i = 0; i < n_rows; i++) {
         auto str = internals::to_string(i);
         csv::string_view sv = str;
         writer << std::array<csv::string_view, 5>({ sv, sv, sv, sv, sv });
