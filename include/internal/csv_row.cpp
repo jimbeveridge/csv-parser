@@ -97,7 +97,10 @@ namespace csv {
         auto field_str = csv::string_view(this->data->data).substr(this->data_start + field.start);
 
         if (field.has_double_quote) {
-            auto& value = this->double_quote_fields[field_index];
+            if (double_quote_fields == nullptr) {
+                double_quote_fields.reset(new std::unordered_map<size_t, std::string>);
+            }
+            auto& value = (*this->double_quote_fields)[field_index];
             if (value.empty()) {
                 bool prev_ch_quote = false;
                 for (size_t i = 0; i < field.length; i++) {

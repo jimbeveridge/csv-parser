@@ -173,7 +173,7 @@ namespace csv {
 
         CSV_INLINE void IBasicCSVParser::enqueue_tombstone()
         {
-            this->current_row = CSVRow(nullptr);
+            this->current_row = CSVRow(&_pa, nullptr);
             //this->current_row = CSVRow({}, this->data_pos, this->current_row.fields.size());
             _channel.wait_enqueue(std::move(current_row));
         }
@@ -205,38 +205,29 @@ namespace csv {
 
         CSV_INLINE void IBasicCSVParser::push_field()
         {
-            // Update
-            if (field_has_double_quote) {
-                current_row.fields.emplace_back(
-                    field_start == UNINITIALIZED_FIELD ? 0 : (unsigned int)field_start,
-                    field_length,
-                    true
-                );
-                field_has_double_quote = false;
-            }
-            else {
-                current_row.fields.emplace_back(
-                    field_start == UNINITIALIZED_FIELD ? 0 : (unsigned int)field_start,
-                    field_length
-                );
-            }
-
-            current_row.row_length++;
+            current_row.fields.emplace_back(
+                field_start == UNINITIALIZED_FIELD ? 0 : (unsigned int)field_start,
+                field_length,
+                field_has_double_quote
+            );
 
             // Reset field state
-            field_start = UNINITIALIZED_FIELD;
+            field_has_double_quote = false;
             field_length = 0;
+            field_start = UNINITIALIZED_FIELD;
+
+            current_row.row_length++;
         }
 
         CSV_INLINE void IBasicCSVParser::processNewline()
         {
             // End of record -> Write record
             this->push_field();
-            auto size = this->_col_names ? this->_col_names->size() : this->current_row.fields.size();
+            auto size = std::max(!this->_col_names ? 0 : this->_col_names->size(), this->current_row.fields.size());
             this->push_row();
 
             // Reset
-            this->current_row = CSVRow(data_ptr, this->data_pos, current_row.fields.size());
+            this->current_row = CSVRow(&this->_pa, data_ptr, this->data_pos, current_row.fields.size());
             this->current_row.fields.reserve(size);
         }
 
@@ -386,7 +377,7 @@ namespace csv {
             stream_pos = this->data_ptr->CreateStringViewSource(_source, stream_pos, length);
 
             // Parse
-            this->current_row = CSVRow(this->data_ptr);
+            this->current_row = CSVRow(&_pa, this->data_ptr);
             bool forceNewline = (stream_pos + this->_iteration_chunk_size >= source_size);
             size_t completed = this->parse(forceNewline);
             this->stream_pos -= (length - completed);
@@ -410,7 +401,7 @@ namespace csv {
                 this->mmap_pos = this->data_ptr->CreateMmapSource(this->_filename, this->mmap_pos, length);
 
                 // Parse
-                this->current_row = CSVRow(this->data_ptr);
+                this->current_row = CSVRow(&_pa, this->data_ptr);
                 // If we are at the end of the file, parse the last line even if there's no newline
                 size_t completed = this->parse(forceNewline);
                 this->mmap_pos -= (length - completed);

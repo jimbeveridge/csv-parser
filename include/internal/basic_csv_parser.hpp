@@ -9,6 +9,7 @@
 #include <fstream>
 #include <future>
 #include <memory>
+#include <memory_resource>
 #include <thread>
 #include <vector>
 
@@ -243,6 +244,10 @@ namespace csv {
             void trim_utf8_bom();
 
         protected:
+
+            std::pmr::monotonic_buffer_resource _mbr{ 1'000'000 };
+            std::pmr::polymorphic_allocator<csv::internals::RawCSVField> _pa{ &_mbr };
+
             /** @name Current Parser State */
             ///@{
             CSVRow current_row;
@@ -344,7 +349,7 @@ namespace csv {
                 const bool forceNewline = (stream_pos + this->_iteration_chunk_size >= source_size);
 
                 // Parse
-                this->current_row = CSVRow(this->data_ptr);
+                this->current_row = CSVRow(&_pa, this->data_ptr);
                 size_t completed = this->parse(forceNewline);
                 this->stream_pos -= (length - completed);
 

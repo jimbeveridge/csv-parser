@@ -2851,6 +2851,7 @@ private:
 #include <fstream>
 #include <future>
 #include <memory>
+#include <memory_resource>
 #include <thread>
 #include <vector>
 
@@ -6549,11 +6550,9 @@ namespace csv {
         struct RawCSVData {
             std::shared_ptr<CSVBasicMMapSource> _dataMmap;
             std::shared_ptr<std::string> _dataString;
-            csv::string_view data = "";
+            csv::string_view data;
 
-            std::unordered_set<size_t> has_double_quotes;
-
-            internals::ColNamesPtr col_names = nullptr;
+            internals::ColNamesPtr col_names;
             internals::ParseFlagMap parse_flags;
             internals::WhitespaceMap ws_flags;
             size_t CreateMmapSource(const std::string& filename, size_t mmap_pos, size_t length);
@@ -6763,9 +6762,9 @@ namespace csv {
         CSVRow() = default;
         
         /** Construct a CSVRow from a RawCSVDataPtr */
-        CSVRow(internals::RawCSVDataPtr _data) : data(_data) {}
-        CSVRow(internals::RawCSVDataPtr _data, size_t _data_start, size_t _field_bounds)
-            : data(_data), data_start(_data_start), fields_start(_field_bounds) {}
+        CSVRow(std::pmr::polymorphic_allocator<csv::internals::RawCSVField>* pa, internals::RawCSVDataPtr _data) : _pa(pa), data(_data) {}
+        CSVRow(std::pmr::polymorphic_allocator<csv::internals::RawCSVField>* pa, internals::RawCSVDataPtr _data, size_t _data_start, size_t _field_bounds)
+            : _pa(pa), data(_data), data_start(_data_start), fields_start(_field_bounds) {}
 
         /** Indicates whether row is empty or not */
         CONSTEXPR bool empty() const noexcept { return this->size() == 0; }
@@ -6863,11 +6862,13 @@ namespace csv {
         /** Retrieve a string view corresponding to the specified index */
         csv::string_view get_field(size_t index) const;
 
+        std::pmr::polymorphic_allocator<csv::internals::RawCSVField>* _pa = nullptr;
+
         internals::RawCSVDataPtr data;
 
-        std::vector<csv::internals::RawCSVField> fields;
+        std::pmr::vector<csv::internals::RawCSVField> fields;
 
-        mutable std::unordered_map<size_t, std::string> double_quote_fields;
+        mutable std::shared_ptr<std::unordered_map<size_t, std::string>> double_quote_fields;
 
         /** Where in RawCSVData.data we start */
         size_t data_start = 0;
@@ -7155,6 +7156,10 @@ namespace csv {
             void trim_utf8_bom();
 
         protected:
+
+            std::pmr::monotonic_buffer_resource _mbr{ 1'000'000 };
+            std::pmr::polymorphic_allocator<csv::internals::RawCSVField> _pa{ &_mbr };
+
             /** @name Current Parser State */
             ///@{
             CSVRow current_row;
@@ -7256,7 +7261,7 @@ namespace csv {
                 const bool forceNewline = (stream_pos + this->_iteration_chunk_size >= source_size);
 
                 // Parse
-                this->current_row = CSVRow(this->data_ptr);
+                this->current_row = CSVRow(&_pa, this->data_ptr);
                 size_t completed = this->parse(forceNewline);
                 this->stream_pos -= (length - completed);
 
@@ -8180,7 +8185,7 @@ namespace csv {
 
         CSV_INLINE void IBasicCSVParser::enqueue_tombstone()
         {
-            this->current_row = CSVRow(nullptr);
+            this->current_row = CSVRow(&_pa, nullptr);
             //this->current_row = CSVRow({}, this->data_pos, this->current_row.fields.size());
             _channel.wait_enqueue(std::move(current_row));
         }
@@ -8212,38 +8217,29 @@ namespace csv {
 
         CSV_INLINE void IBasicCSVParser::push_field()
         {
-            // Update
-            if (field_has_double_quote) {
-                current_row.fields.emplace_back(
-                    field_start == UNINITIALIZED_FIELD ? 0 : (unsigned int)field_start,
-                    field_length,
-                    true
-                );
-                field_has_double_quote = false;
-            }
-            else {
-                current_row.fields.emplace_back(
-                    field_start == UNINITIALIZED_FIELD ? 0 : (unsigned int)field_start,
-                    field_length
-                );
-            }
-
-            current_row.row_length++;
+            current_row.fields.emplace_back(
+                field_start == UNINITIALIZED_FIELD ? 0 : (unsigned int)field_start,
+                field_length,
+                field_has_double_quote
+            );
 
             // Reset field state
-            field_start = UNINITIALIZED_FIELD;
+            field_has_double_quote = false;
             field_length = 0;
+            field_start = UNINITIALIZED_FIELD;
+
+            current_row.row_length++;
         }
 
         CSV_INLINE void IBasicCSVParser::processNewline()
         {
             // End of record -> Write record
             this->push_field();
-            auto size = this->_col_names ? this->_col_names->size() : this->current_row.fields.size();
+            auto size = std::max(!this->_col_names ? 0 : this->_col_names->size(), this->current_row.fields.size());
             this->push_row();
 
             // Reset
-            this->current_row = CSVRow(data_ptr, this->data_pos, current_row.fields.size());
+            this->current_row = CSVRow(&this->_pa, data_ptr, this->data_pos, current_row.fields.size());
             this->current_row.fields.reserve(size);
         }
 
@@ -8393,7 +8389,7 @@ namespace csv {
             stream_pos = this->data_ptr->CreateStringViewSource(_source, stream_pos, length);
 
             // Parse
-            this->current_row = CSVRow(this->data_ptr);
+            this->current_row = CSVRow(&_pa, this->data_ptr);
             bool forceNewline = (stream_pos + this->_iteration_chunk_size >= source_size);
             size_t completed = this->parse(forceNewline);
             this->stream_pos -= (length - completed);
@@ -8417,7 +8413,7 @@ namespace csv {
                 this->mmap_pos = this->data_ptr->CreateMmapSource(this->_filename, this->mmap_pos, length);
 
                 // Parse
-                this->current_row = CSVRow(this->data_ptr);
+                this->current_row = CSVRow(&_pa, this->data_ptr);
                 // If we are at the end of the file, parse the last line even if there's no newline
                 size_t completed = this->parse(forceNewline);
                 this->mmap_pos -= (length - completed);
@@ -8984,7 +8980,10 @@ namespace csv {
         auto field_str = csv::string_view(this->data->data).substr(this->data_start + field.start);
 
         if (field.has_double_quote) {
-            auto& value = this->double_quote_fields[field_index];
+            if (double_quote_fields == nullptr) {
+                double_quote_fields.reset(new std::unordered_map<size_t, std::string>);
+            }
+            auto& value = (*this->double_quote_fields)[field_index];
             if (value.empty()) {
                 bool prev_ch_quote = false;
                 for (size_t i = 0; i < field.length; i++) {

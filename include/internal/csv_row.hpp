@@ -121,11 +121,9 @@ namespace csv {
         struct RawCSVData {
             std::shared_ptr<CSVBasicMMapSource> _dataMmap;
             std::shared_ptr<std::string> _dataString;
-            csv::string_view data = "";
+            csv::string_view data;
 
-            std::unordered_set<size_t> has_double_quotes;
-
-            internals::ColNamesPtr col_names = nullptr;
+            internals::ColNamesPtr col_names;
             internals::ParseFlagMap parse_flags;
             internals::WhitespaceMap ws_flags;
             size_t CreateMmapSource(const std::string& filename, size_t mmap_pos, size_t length);
@@ -335,9 +333,9 @@ namespace csv {
         CSVRow() = default;
         
         /** Construct a CSVRow from a RawCSVDataPtr */
-        CSVRow(internals::RawCSVDataPtr _data) : data(_data) {}
-        CSVRow(internals::RawCSVDataPtr _data, size_t _data_start, size_t _field_bounds)
-            : data(_data), data_start(_data_start), fields_start(_field_bounds) {}
+        CSVRow(std::pmr::polymorphic_allocator<csv::internals::RawCSVField>* pa, internals::RawCSVDataPtr _data) : _pa(pa), data(_data) {}
+        CSVRow(std::pmr::polymorphic_allocator<csv::internals::RawCSVField>* pa, internals::RawCSVDataPtr _data, size_t _data_start, size_t _field_bounds)
+            : _pa(pa), data(_data), data_start(_data_start), fields_start(_field_bounds) {}
 
         /** Indicates whether row is empty or not */
         CONSTEXPR bool empty() const noexcept { return this->size() == 0; }
@@ -435,11 +433,13 @@ namespace csv {
         /** Retrieve a string view corresponding to the specified index */
         csv::string_view get_field(size_t index) const;
 
+        std::pmr::polymorphic_allocator<csv::internals::RawCSVField>* _pa = nullptr;
+
         internals::RawCSVDataPtr data;
 
-        std::vector<csv::internals::RawCSVField> fields;
+        std::pmr::vector<csv::internals::RawCSVField> fields;
 
-        mutable std::unordered_map<size_t, std::string> double_quote_fields;
+        mutable std::shared_ptr<std::unordered_map<size_t, std::string>> double_quote_fields;
 
         /** Where in RawCSVData.data we start */
         size_t data_start = 0;

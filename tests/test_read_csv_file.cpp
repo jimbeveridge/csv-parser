@@ -199,8 +199,8 @@ TEST_CASE("No trailing newline", "[read_no_ending_newline]") {
     format.header_row(-1);
 
     CSVReader reader1(kTempCsv, format);
-    CSVRow row;
-    REQUIRE(reader1.read_row(row));
+    CSVRow first_row;
+    REQUIRE(reader1.read_row(first_row));
 
     CSVReader reader2(kTempCsv, format);
     int count = 0;
